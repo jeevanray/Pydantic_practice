@@ -1,6 +1,6 @@
 # Overview of Pydantic v2
 
-This repository provides an in-depth overview of the `pydantic` library, version `2.3.0`. Pydantic is a crucial data validation and settings management library for Python, enabling the early identification and rectification of errors.
+This repository provides an in-depth overview of the `pydantic` library, version `2.9.2`. Pydantic is a crucial data validation and settings management library for Python, enabling the early identification and rectification of errors.
 
 ## Table of Contents
 

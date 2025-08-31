@@ -10,6 +10,7 @@ import oracledb
 import pytz
 from datetime import datetime
 import yaml
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # External dependency expected by the caller's environment
 # Must provide a safe, public API. We will try a graceful fallback if some methods are absent.
@@ -105,6 +106,7 @@ def prepare_auditing() -> Dict[str, Any]:
     }
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type(Exception))
 def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[str, Any], aud_dt: str) -> None:
     """Load prior audit row (if any) and merge into audit_log using bind variables."""
     query = f"""
@@ -169,6 +171,7 @@ def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[s
         close_connection(cur, conn)
 
 
+
 def _ensure_time_fields(audit_data: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize types for time fields and booleans prior to MERGE."""
     # boolean -> 'Y'/'N'
@@ -191,6 +194,7 @@ def _ensure_time_fields(audit_data: Dict[str, Any]) -> Dict[str, Any]:
     return audit_data
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type(Exception))
 def update_audit_record(config_audit: Dict[str, Any], audit_data: Dict[str, Any]) -> None:
     """Upsert audit row by (source_table, business_loaddt) using bind variables."""
     audit_data = _ensure_time_fields(audit_data)
@@ -270,6 +274,7 @@ def update_audit_record(config_audit: Dict[str, Any], audit_data: Dict[str, Any]
         close_connection(cur, conn)
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type(Exception))
 def get_load_status_and_dates(config_audit: Dict[str, Any], source_table: str, current_business_loaddt: str) -> List[Dict[str, Any]]:
     """
     Returns list of dicts with keys: business_loaddt (YYYY-MM-DD str), status, restart_point, total_records.
@@ -325,6 +330,7 @@ def get_load_status_and_dates(config_audit: Dict[str, Any], source_table: str, c
         close_connection(cur, conn)
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type(Exception))
 def create_audit_table_if_not_exists(config_audit: Dict[str, Any]) -> None:
     """Create audit table if missing. Uses unquoted uppercase identifiers for consistency."""
     check_query = """
@@ -417,6 +423,7 @@ def _update_audit_with_retry(config_audit: Dict[str, Any], audit_log: Dict[str, 
 # MinIO upload helper
 # -----------------------------------------------------------------------------
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type(Exception))
 def _upload_df_parquet(minio_client: MinioHandler, df: pd.DataFrame, object_path: str, compression: str = "snappy") -> None:
     """Try a public helper on MinioHandler; fallback to writing bytes and putting object.
     Your MinioHandler should expose either `upload_dataframe(df, object_path, format, compression)`

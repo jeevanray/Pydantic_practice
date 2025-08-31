@@ -1,0 +1,41 @@
+# Dummy config for minio_ingestion.py
+# Replace placeholders with real values or environment references in production
+
+oracle:
+  user: "ODS_USER"
+  password: "change_me"
+  dsn: "host:1521/ORCLPDB1"
+
+minio:
+  endpoint: "play.min.io:9000"
+  access_key: "minioaccess"
+  secret_key: "miniopass"
+  bucket_name: "my-bucket"
+  secure: true
+  verify_certs: true
+
+audit:
+  schema: "UDS"
+  audit_table: "AIRFLOW_CDP_DIAPI_RUN_LOG"
+  output_file_path: "segmentation/segmentdb_6550/input_data/customer_data/customer_profile"
+
+extraction:
+  source_table: "CDP_UNICA_REFINED.CUSTOMER_PROFILE"
+  base_object_path: "segmentation/segmentdb_6550/input_data/customer_data/customer_profile"
+  business_load_date: "2025-08-31"
+  chunk_size: 50000
+  compression: "snappy"
+  order_by: "CUSTOMER_ID"
+  select_columns:
+    - "CUSTOMER_ID"
+    - "NAME"
+    - "EMAIL"
+    - "BUSINESS_LOADDT"
+  mapping_column: "CUSTOMER_ID"
+  delta_columns:
+    - "LAST_MODIFIED_TS"
+    - "STATUS"
+
+# Optional runtime flags
+logging:
+  level: "INFO"

@@ -492,6 +492,7 @@ def oracle_to_minio_parquet(
     select_columns: Optional[Sequence[str]] = None,
     mapping_column: Optional[str] = None,
     delta_columns: Optional[Sequence[str]] = None,
+    minio_handler: Optional['MinioHandler'] = None
 ) -> None:
     """
     Extract rows from Oracle table and upload to MinIO as parquet in chunks with restartability.

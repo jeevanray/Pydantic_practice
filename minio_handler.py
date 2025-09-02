@@ -1,20 +1,20 @@
-
 import io
 import json
-import os
-import time
-import hashlib
 import logging
+import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Optional, Union, List, Generator, Callable
+from typing import Any, Dict, Generator, List, Optional, Union
+from urllib.parse import unquote
 import urllib3
 
 import pandas as pd
 from minio import Minio
-from minio.error import S3Error
-from minio.deleteobjects import DeleteObject
 from minio.commonconfig import CopySource
+from minio.deleteobjects import DeleteObject
+from minio.error import S3Error
 
 
 class MinioConnectionError(Exception):
@@ -28,50 +28,49 @@ class MinioOperationError(Exception):
 
 
 class MinioHandler:
+    """
+    A comprehensive handler for MinIO object storage operations.
+
+    This class provides a robust interface for interacting with MinIO servers,
+    including file operations, data management, and administrative tasks.
+
+    Attributes:
+        client (Minio): The MinIO client instance.
+        bucket_name (str): The default bucket name for operations.
+        logger (logging.Logger): Logger instance for operation tracking.
+        _bucket_exists_cache (Dict[str, bool]): Cache for bucket existence checks.
+        _lock (threading.RLock): Thread lock for safe concurrent operations.
+    """
     def __init__(self, config: Dict[str, Any]):
         """
-        Initializes the MinioHandler with MinIO connection details.
-        
+        Initializes the MinioHandler.
+
         Args:
-            config (Dict[str, Any]): Dictionary containing:
-                - endpoint: MinIO server endpoint
-                - access_key: Access key for authentication
-                - secret_key: Secret key for authentication
-                - bucket_name: Optional bucket name (default: "sbi-test")
-                - secure: Optional SSL flag (default: True)
-                - region: Optional region
+            config (Dict[str, Any]): A dictionary containing MinIO connection details.
         """
         required_keys = ['endpoint', 'access_key', 'secret_key']
         missing_keys = [key for key in required_keys if key not in config]
         if missing_keys:
             raise ValueError(f"Missing required configuration keys: {missing_keys}")
 
-        self._config = config.copy()
+        self._config = config.copy()  # Make a copy to avoid modifying the original
         self.endpoint = self._config['endpoint']
         self.bucket_name = self._config.get('bucket_name', "sbi-test")
-        
-        # Remove bucket_name from config as it's not needed for Minio client
-        self._config.pop('bucket_name', None)
+        self._config.pop('bucket_name', None)  # Remove bucket_name from config
 
         self.client: Optional[Minio] = None
         self.logger = self._setup_logging()
+        self._bucket_exists_cache: Dict[str, bool] = {}
         self._lock = threading.RLock()
-        self._bucket_exists_cache = {}
-        self._is_connected = False
 
         # Initialize the connection
-        try:
-            self.connect()
-        except Exception as e:
-            self.logger.error(f"Failed to initialize connection: {e}")
-            # Don't raise here to allow manual connection later
+        self.connect()
 
     def __enter__(self):
         """
         Establishes a MinIO client connection for the `with` statement.
         """
-        if not self._is_connected:
-            self.connect()
+        self.connect()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -85,8 +84,8 @@ class MinioHandler:
         Establishes a MinIO client connection manually.
         """
         with self._lock:
-            if self.client and self._is_connected:
-                self.logger.debug("Connection already exists and is healthy.")
+            if self.client:
+                self.logger.debug("Connection already exists.")
                 return
 
             try:
@@ -105,49 +104,84 @@ class MinioHandler:
                     minio_config['region'] = self._config['region']
 
                 self.client = Minio(**minio_config, http_client=http_client)
-                self.logger.info(f"MinIO client created for endpoint: {self.endpoint}")
 
-                # Test the connection by trying to list buckets
-                self._validate_connection()
-                
-                # Validate the default bucket exists
+                # Validate connection by checking bucket
                 try:
                     if not self.client.bucket_exists(self.bucket_name):
-                        self.logger.warning(f"Default bucket '{self.bucket_name}' does not exist.")
-                        # Optionally create the bucket or let it fail on first operation
-                        try:
-                            self.client.make_bucket(self.bucket_name)
-                            self.logger.info(f"Created default bucket '{self.bucket_name}'")
-                        except Exception as bucket_create_error:
-                            self.logger.error(f"Failed to create bucket '{self.bucket_name}': {bucket_create_error}")
-                            raise MinioOperationError(f"Default bucket '{self.bucket_name}' does not exist and cannot be created: {bucket_create_error}")
-                    else:
-                        self.logger.info(f"Default bucket '{self.bucket_name}' is accessible")
-                        
+                        self.logger.warning(f"Bucket {self.bucket_name} does not exist.")
+                        raise MinioOperationError(f"Bucket {self.bucket_name} does not exist")
+                    self.logger.info("MinioClient connection established successfully.")
                 except Exception as bucket_error:
                     self.client = None
-                    self._is_connected = False
                     raise MinioOperationError(f"Bucket validation failed: {bucket_error}")
-
-                self._is_connected = True
-                self.logger.info("MinIO connection established successfully")
 
             except Exception as e:
                 self.client = None
-                self._is_connected = False
-                self.logger.error(f"Failed to connect to MinIO: {e}")
-                raise MinioConnectionError(f"Failed to connect to MinIO: {e}")
+                self.logger.error(f"Failed to connect to Minio: {e}")
+                raise MinioConnectionError(f"Failed to connect to Minio: {e}")
 
     def close(self):
         """
         Closes the MinIO client connection manually.
         """
-        with self._lock:
-            if self.client:
-                self.logger.info("MinIO connection closed")
-                self.client = None
-                self._is_connected = False
-                self._bucket_exists_cache = {}
+        if self.client:
+            print("MinioClient connection closed.")
+            self.client = None
+
+    # def __init__(
+    #     self,
+    #     endpoint: str,
+    #     access_key: str,
+    #     secret_key: str,
+    #     bucket_name: str,
+    #     secure: bool = True,
+    #     region: Optional[str] = None
+    # ) -> None:
+        """
+        Initialize MinIO handler with connection parameters.
+
+        Args:
+            endpoint: MinIO server endpoint (e.g., 'localhost:9000').
+            access_key: Access key for authentication.
+            secret_key: Secret key for authentication.
+            bucket_name: Default bucket name for operations.
+            secure: Whether to use HTTPS (default: True).
+            region: Optional region specification.
+
+        Raises:
+            MinioConnectionError: If connection to MinIO server fails.
+            MinioOperationError: If bucket creation/validation fails.
+        """
+        '''
+        self.endpoint = endpoint
+        self.bucket_name = bucket_name
+        self.logger = self._setup_logging()
+        self._bucket_exists_cache: Dict[str, bool] = {}
+        self._lock = threading.RLock()
+        http_client = None
+
+        try:
+            # Initialize MinIO client
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            http_client = urllib3.PoolManager(cert_reqs='CERT_NONE')
+            self.client = Minio(
+                endpoint=endpoint,
+                access_key=access_key,
+                secret_key=secret_key,
+                secure=secure,
+                region=region,
+                http_client=http_client
+            )
+
+            # Test connection and ensure bucket exists
+            self._validate_connection()
+            self._ensure_bucket_exists(bucket_name)
+
+            self.logger.info(f"MinioHandler initialized successfully for bucket '{bucket_name}'")
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize MinioHandler: {str(e)}")
+            raise MinioConnectionError(f"Failed to connect to MinIO server: {str(e)}")'''
 
     def _setup_logging(self) -> logging.Logger:
         """Set up logging for the MinIO handler."""
@@ -164,27 +198,14 @@ class MinioHandler:
 
     def _validate_connection(self) -> None:
         """Validate connection to MinIO server."""
-        if not self.client:
-            raise MinioConnectionError("MinIO client not initialized")
-            
         try:
-            # Test connection by listing buckets
-            buckets = list(self.client.list_buckets())
-            self.logger.debug(f"Connection validated. Found {len(buckets)} buckets")
+            # Simple operation to test connection
+            list(self.client.list_buckets())
         except Exception as e:
             raise MinioConnectionError(f"Cannot connect to MinIO server: {str(e)}")
 
-    def _ensure_connection(self) -> None:
-        """Ensure connection is active before operations."""
-        if not self.client or not self._is_connected:
-            self.logger.warning("Connection not active, attempting to reconnect...")
-            self.connect()
-
     def _ensure_bucket_exists(self, bucket_name: str) -> None:
         """Ensure bucket exists, create if it doesn't."""
-        if bucket_name in self._bucket_exists_cache:
-            return
-            
         try:
             if not self.client.bucket_exists(bucket_name):
                 self.client.make_bucket(bucket_name)
@@ -202,18 +223,12 @@ class MinioHandler:
         """
         try:
             start_time = time.time()
-            
-            # Ensure connection is active
-            self._ensure_connection()
+            if not self.client:
+                raise ValueError("MinioClient not connected. Call connect() or use a `with` block.")
 
             if not self.bucket_name:
                 self.logger.error("Bucket name not specified in the constructor.")
-                return {
-                    "status": "unhealthy",
-                    "error": "No default bucket specified",
-                    "timestamp": time.time()
-                }
-
+                return False
             # Test basic operations
             buckets = list(self.client.list_buckets())
             bucket_accessible = self.client.bucket_exists(self.bucket_name)
@@ -229,7 +244,6 @@ class MinioHandler:
                 "bucket_name": self.bucket_name,
                 "bucket_accessible": bucket_accessible,
                 "total_buckets": len(buckets),
-                "object_count": len(objects),
                 "response_time_ms": round(response_time * 1000, 2),
                 "timestamp": time.time()
             }
@@ -239,7 +253,6 @@ class MinioHandler:
             return {
                 "status": "unhealthy",
                 "error": str(e),
-                "endpoint": self.endpoint,
                 "timestamp": time.time()
             }
 
@@ -263,18 +276,13 @@ class MinioHandler:
         Raises:
             MinioOperationError: If file reading fails.
         """
-        self._ensure_connection()
         bucket = bucket_name or self.bucket_name
 
         try:
-            self.logger.debug(f"Reading file '{object_path}' from bucket '{bucket}' as {return_type}")
-            
             response = self.client.get_object(bucket, object_path)
             data = response.read()
             response.close()
             response.release_conn()
-
-            self.logger.info(f"Successfully read file '{object_path}' ({len(data)} bytes)")
 
             if return_type == 'bytes':
                 return data
@@ -297,7 +305,7 @@ class MinioHandler:
                 raise ValueError(f"Unsupported return_type: {return_type}")
 
         except S3Error as e:
-            self.logger.error(f"S3 error reading file '{object_path}': {str(e)}")
+            self.logger.error(f"Failed to read file '{object_path}': {str(e)}")
             raise MinioOperationError(f"Failed to read file: {str(e)}")
         except Exception as e:
             self.logger.error(f"Unexpected error reading file '{object_path}': {str(e)}")
@@ -328,7 +336,6 @@ class MinioHandler:
             MinioOperationError: If download fails.
             FileExistsError: If local file exists and overwrite is False.
         """
-        self._ensure_connection()
         bucket = bucket_name or self.bucket_name
         local_path_obj = Path(local_path)
 
@@ -340,8 +347,6 @@ class MinioHandler:
         local_path_obj.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            self.logger.debug(f"Downloading '{object_path}' to '{local_path}'")
-            
             if progress_callback:
                 # Download with progress tracking
                 response = self.client.get_object(bucket, object_path)
@@ -366,7 +371,7 @@ class MinioHandler:
                 # Simple download
                 self.client.fget_object(bucket, object_path, local_path)
 
-            self.logger.info(f"Successfully downloaded '{object_path}' to '{local_path}'")
+            self.logger.info(f"Downloaded '{object_path}' to '{local_path}'")
             return str(local_path_obj.absolute())
 
         except Exception as e:
@@ -387,13 +392,11 @@ class MinioHandler:
         Raises:
             MinioOperationError: If deletion fails.
         """
-        self._ensure_connection()
         bucket = bucket_name or self.bucket_name
 
         try:
-            self.logger.debug(f"Deleting file '{object_path}' from bucket '{bucket}'")
             self.client.remove_object(bucket, object_path)
-            self.logger.info(f"Successfully deleted file '{object_path}' from bucket '{bucket}'")
+            self.logger.info(f"Deleted file '{object_path}' from bucket '{bucket}'")
             return True
 
         except Exception as e:
@@ -420,14 +423,11 @@ class MinioHandler:
         Raises:
             MinioOperationError: If deletion fails.
         """
-        self._ensure_connection()
         bucket = bucket_name or self.bucket_name
         folder_path = folder_path.rstrip('/') + '/'
         deleted_count = 0
 
         try:
-            self.logger.debug(f"Deleting folder '{folder_path}' from bucket '{bucket}'")
-            
             # Get all objects in the folder
             objects = self.client.list_objects(bucket, prefix=folder_path, recursive=True)
 
@@ -452,7 +452,7 @@ class MinioHandler:
                         self.logger.error(f"Failed to delete {error.object_name}: {error}")
                 deleted_count += len(batch) - len(errors)
 
-            self.logger.info(f"Successfully deleted folder '{folder_path}' with {deleted_count} objects")
+            self.logger.info(f"Deleted folder '{folder_path}' with {deleted_count} objects")
             return deleted_count
 
         except Exception as e:
@@ -484,7 +484,6 @@ class MinioHandler:
             MinioOperationError: If upload fails.
             FileNotFoundError: If local file doesn't exist.
         """
-        self._ensure_connection()
         bucket = bucket_name or self.bucket_name
         local_file = Path(local_path)
 
@@ -495,19 +494,9 @@ class MinioHandler:
             object_path = local_file.name
 
         try:
-            self.logger.debug(f"Uploading '{local_path}' to '{object_path}' in bucket '{bucket}'")
-            
             # Auto-detect content type if not provided
             if not content_type:
                 content_type = self._get_content_type(local_file.suffix)
-                
-            # Calculate MD5 hash
-            md5_hash = self._calculate_md5(str(local_file))
-            
-            # Update metadata with MD5
-            if metadata is None:
-                metadata = {}
-            metadata['Content-MD5'] = md5_hash
 
             self.client.fput_object(
                 bucket,
@@ -517,7 +506,7 @@ class MinioHandler:
                 metadata=metadata
             )
 
-            self.logger.info(f"Successfully uploaded '{local_path}' to '{object_path}'")
+            self.logger.info(f"Uploaded '{local_path}' to '{object_path}'")
             return object_path
 
         except Exception as e:
@@ -551,7 +540,6 @@ class MinioHandler:
             MinioOperationError: If upload fails.
             FileNotFoundError: If local file doesn't exist.
         """
-        self._ensure_connection()
         bucket = bucket_name or self.bucket_name
         local_file = Path(local_path)
 
@@ -563,7 +551,6 @@ class MinioHandler:
 
         try:
             file_size = local_file.stat().st_size
-            self.logger.debug(f"Uploading large file '{local_path}' ({file_size} bytes) to '{object_path}'")
 
             # Use progress callback wrapper if provided
             if progress_callback:
@@ -589,17 +576,6 @@ class MinioHandler:
 
             try:
                 content_type = self._get_content_type(local_file.suffix)
-                
-                # Calculate MD5 hash of the file
-                md5_hash = self._calculate_md5(str(local_file))
-                
-                # Update metadata with MD5
-                if metadata is None:
-                    metadata = {}
-                metadata.update({
-                    'Content-MD5': md5_hash,
-                    'Content-Type': content_type
-                })
 
                 result = self.client.put_object(
                     bucket,
@@ -611,7 +587,7 @@ class MinioHandler:
                     part_size=part_size
                 )
 
-                self.logger.info(f"Successfully uploaded large file '{local_path}' to '{object_path}' (ETag: {result.etag})")
+                self.logger.info(f"Uploaded large file '{local_path}' to '{object_path}' (ETag: {result.etag})")
                 return object_path
 
             finally:
@@ -628,7 +604,6 @@ class MinioHandler:
         format: str = 'csv',
         chunk_size: Optional[int] = None,
         compression: Optional[str] = None,
-        bucket_name: Optional[str] = None,
         **kwargs
     ) -> Union[str, List[str]]:
         """
@@ -640,7 +615,6 @@ class MinioHandler:
             format: File format ('csv', 'parquet', 'json', 'excel').
             chunk_size: Optional chunk size for large DataFrames.
             compression: Optional compression ('gzip', 'bz2', 'xz').
-            bucket_name: Optional bucket name (uses default if not specified).
             **kwargs: Additional arguments passed to pandas methods.
 
         Returns:
@@ -650,16 +624,11 @@ class MinioHandler:
             MinioOperationError: If upload fails.
             ValueError: If unsupported format is specified.
         """
-        self._ensure_connection()
-        bucket = bucket_name or self.bucket_name
-
         try:
-            self.logger.debug(f"Uploading DataFrame ({len(df)} rows) to '{object_path}' as {format}")
-            
             if chunk_size and len(df) > chunk_size:
-                return self._upload_dataframe_chunked(df, object_path, format, chunk_size, compression, bucket, **kwargs)
+                return self._upload_dataframe_chunked(df, object_path, format, chunk_size, compression, **kwargs)
             else:
-                return self._upload_dataframe_single(df, object_path, format, compression, bucket, **kwargs)
+                return self._upload_dataframe_single(df, object_path, format, compression, **kwargs)
 
         except Exception as e:
             self.logger.error(f"Failed to upload DataFrame: {str(e)}")
@@ -671,48 +640,37 @@ class MinioHandler:
         object_path: str,
         format: str,
         compression: Optional[str] = None,
-        bucket: str = None,
         **kwargs
     ) -> str:
         """Upload DataFrame as a single file."""
         buffer = io.BytesIO()
 
-            if format == 'csv':
-                df.to_csv(buffer, index=False, compression=compression, **kwargs)
-                content_type = 'text/csv'
-            elif format == 'parquet':
-                df.to_parquet(buffer, compression=compression, **kwargs)
-                content_type = 'application/octet-stream'
-            elif format == 'json':
-                df.to_json(buffer, compression=compression, **kwargs)
-                content_type = 'application/json'
-            elif format == 'excel':
-                df.to_excel(buffer, index=False, **kwargs)
-                content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            else:
-                raise ValueError(f"Unsupported format: {format}")
+        if format == 'csv':
+            df.to_csv(buffer, index=False, compression=compression, **kwargs)
+            content_type = 'text/csv'
+        elif format == 'parquet':
+            df.to_parquet(buffer, compression=compression, **kwargs)
+            content_type = 'application/octet-stream'
+        elif format == 'json':
+            df.to_json(buffer, compression=compression, **kwargs)
+            content_type = 'application/json'
+        elif format == 'excel':
+            df.to_excel(buffer, index=False, **kwargs)
+            content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        else:
+            raise ValueError(f"Unsupported format: {format}")
 
-            buffer.seek(0)
-            data = buffer.getvalue()
-            
-            # Calculate MD5 hash
-            md5_hash = self._calculate_md5(data)
-            
-            # Add metadata
-            metadata = {
-                'Content-MD5': md5_hash,
-                'Content-Type': content_type,
-                'X-Format': format
-            }
+        buffer.seek(0)
 
-            self.client.put_object(
-                bucket,
-                object_path,
-                io.BytesIO(data),
-                length=len(data),
-                content_type=content_type,
-                metadata=metadata
-            )        self.logger.info(f"Successfully uploaded DataFrame to '{object_path}' as {format}")
+        self.client.put_object(
+            self.bucket_name,
+            object_path,
+            buffer,
+            length=len(buffer.getvalue()),
+            content_type=content_type
+        )
+
+        self.logger.info(f"Uploaded DataFrame to '{object_path}' as {format}")
         return object_path
 
     def _upload_dataframe_chunked(
@@ -722,7 +680,6 @@ class MinioHandler:
         format: str,
         chunk_size: int,
         compression: Optional[str] = None,
-        bucket: str = None,
         **kwargs
     ) -> List[str]:
         """Upload DataFrame in chunks."""
@@ -733,10 +690,10 @@ class MinioHandler:
 
         for i, chunk in enumerate(chunks):
             chunk_path = f"{base_path}_part_{i+1:04d}{ext}"
-            self._upload_dataframe_single(chunk, chunk_path, format, compression, bucket, **kwargs)
+            self._upload_dataframe_single(chunk, chunk_path, format, compression, **kwargs)
             uploaded_paths.append(chunk_path)
 
-        self.logger.info(f"Successfully uploaded DataFrame in {len(chunks)} chunks to '{base_path}_part_*{ext}'")
+        self.logger.info(f"Uploaded DataFrame in {len(chunks)} chunks to '{base_path}_part_*{ext}'")
         return uploaded_paths
 
     def list_objects(
@@ -759,16 +716,12 @@ class MinioHandler:
         Raises:
             MinioOperationError: If listing fails.
         """
-        self._ensure_connection()
         bucket = bucket_name or self.bucket_name
 
         try:
-            self.logger.debug(f"Listing objects in bucket '{bucket}' with prefix '{prefix}'")
             objects = self.client.list_objects(bucket, prefix=prefix, recursive=recursive)
 
-            count = 0
             for obj in objects:
-                count += 1
                 yield {
                     'object_name': obj.object_name,
                     'size': obj.size,
@@ -777,8 +730,6 @@ class MinioHandler:
                     'content_type': getattr(obj, 'content_type', None),
                     'is_dir': obj.is_dir
                 }
-            
-            self.logger.debug(f"Listed {count} objects in bucket '{bucket}'")
 
         except Exception as e:
             self.logger.error(f"Failed to list objects: {str(e)}")
@@ -795,15 +746,12 @@ class MinioHandler:
         Returns:
             True if object exists, False otherwise.
         """
-        self._ensure_connection()
         bucket = bucket_name or self.bucket_name
 
         try:
             self.client.stat_object(bucket, object_path)
-            self.logger.debug(f"Object '{object_path}' exists in bucket '{bucket}'")
             return True
         except S3Error:
-            self.logger.debug(f"Object '{object_path}' does not exist in bucket '{bucket}'")
             return False
         except Exception as e:
             self.logger.error(f"Error checking object existence: {str(e)}")
@@ -823,14 +771,12 @@ class MinioHandler:
         Raises:
             MinioOperationError: If getting object info fails.
         """
-        self._ensure_connection()
         bucket = bucket_name or self.bucket_name
 
         try:
-            self.logger.debug(f"Getting info for object '{object_path}' in bucket '{bucket}'")
             stat = self.client.stat_object(bucket, object_path)
 
-            info = {
+            return {
                 'object_name': stat.object_name,
                 'size': stat.size,
                 'etag': stat.etag,
@@ -839,9 +785,6 @@ class MinioHandler:
                 'metadata': stat.metadata,
                 'version_id': getattr(stat, 'version_id', None)
             }
-            
-            self.logger.debug(f"Retrieved info for object '{object_path}' ({stat.size} bytes)")
-            return info
 
         except Exception as e:
             self.logger.error(f"Failed to get object info for '{object_path}': {str(e)}")
@@ -871,12 +814,10 @@ class MinioHandler:
         Raises:
             MinioOperationError: If copy operation fails.
         """
-        self._ensure_connection()
         src_bucket = source_bucket or self.bucket_name
         dst_bucket = destination_bucket or self.bucket_name
 
         try:
-            self.logger.debug(f"Copying '{src_bucket}/{source_path}' to '{dst_bucket}/{destination_path}'")
             copy_source = CopySource(src_bucket, source_path)
 
             self.client.copy_object(
@@ -886,44 +827,12 @@ class MinioHandler:
                 metadata=metadata
             )
 
-            self.logger.info(f"Successfully copied '{src_bucket}/{source_path}' to '{dst_bucket}/{destination_path}'")
+            self.logger.info(f"Copied '{src_bucket}/{source_path}' to '{dst_bucket}/{destination_path}'")
             return destination_path
 
         except Exception as e:
             self.logger.error(f"Failed to copy object: {str(e)}")
             raise MinioOperationError(f"Failed to copy object: {str(e)}")
-
-    def _calculate_md5(self, data: Union[bytes, io.BytesIO, str]) -> str:
-        """Calculate MD5 hash of data.
-        
-        Args:
-            data: Data to hash (bytes, BytesIO, or file path)
-            
-        Returns:
-            MD5 hash as hexadecimal string
-        """
-        md5_hash = hashlib.md5()
-        
-        if isinstance(data, bytes):
-            md5_hash.update(data)
-        elif isinstance(data, io.BytesIO):
-            while True:
-                chunk = data.read(8192)  # Read in 8KB chunks
-                if not chunk:
-                    break
-                md5_hash.update(chunk)
-            data.seek(0)  # Reset buffer position
-        elif isinstance(data, str) and os.path.isfile(data):
-            with open(data, 'rb') as f:
-                while True:
-                    chunk = f.read(8192)
-                    if not chunk:
-                        break
-                    md5_hash.update(chunk)
-        else:
-            raise ValueError("Data must be bytes, BytesIO, or valid file path")
-            
-        return md5_hash.hexdigest()
 
     def _get_content_type(self, file_extension: str) -> str:
         """Get content type based on file extension."""
@@ -950,39 +859,35 @@ class MinioHandler:
         return content_types.get(file_extension.lower(), 'application/octet-stream')
 
 
-# Example usage:
+
+# Example usage and testing
 if __name__ == "__main__":
-    config = {
-        'endpoint': 'localhost:9000',
-        'access_key': 'minioadmin',
-        'secret_key': 'minioadmin',
-        'bucket_name': 'test-bucket',
-        'secure': False
-    }
-    
-    # Usage with context manager
+    # Example usage
+    minio_config = dict(endpoint="minio-cdp-prod.apps.ocpdwhp.dwhmartr.bank",
+            access_key='xvMjyTKmmjhdgjnhWwbr6Ha',
+            secret_key='nhfghnhg',
+            bucket_name='test',
+            secure=True)
+
+
     try:
-        with MinioHandler(config) as minio:
-            health = minio.health_check()
-            print(f"Health status: {health}")
-            
-            # Upload a file
-            # minio.upload_file('test.txt', 'uploads/test.txt')
-            
-    except MinioConnectionError as e:
-        print(f"Connection error: {e}")
-    except MinioOperationError as e:
-        print(f"Operation error: {e}")
-    
-    # Usage without context manager
+        with MinioHandler(minio_config) as handler:
+            health = handler.health_check()
+            print(f"Health status for bucket: {health}")
+    except RuntimeError as e:
+        print(f"Error during MinIO operation: {e}")
+
+    # --- Use Case 2: Using without a context manager (manual connection) ---
+    print("\n--- Testing without 'with' statement ---")
+    handler = None
     try:
-        minio = MinioHandler(config)
-        # Use minio operations
-        health = minio.health_check()
-        print(f"Health status: {health}")
-        
-        # Remember to close when done
-        minio.close()
-        
-    except Exception as e:
-        print(f"Error: {e}")
+        handler = MinioHandler(minio_config)
+        handler.connect()
+
+        health = handler.health_check()
+        print(f"Health status for bucket': {health}")
+
+    except RuntimeError as e:
+        print(f"Error during MinIO operation: {e}")
+    finally:
+        if handler:

@@ -113,7 +113,8 @@ class MinioHandler(Minio):
                 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                 http_client = urllib3.PoolManager(cert_reqs='CERT_NONE')
             else:
-                http_client = None
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                http_client = urllib3.PoolManager(cert_reqs='CERT_NONE')
             
             # Prepare Minio constructor arguments
             minio_kwargs = {

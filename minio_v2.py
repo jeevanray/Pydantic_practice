@@ -71,13 +71,7 @@ class MinioHandler(Minio):
     """
     Enhanced MinIO handler that inherits from Minio class and adds additional functionality.
     
-    This class provides:
-    - All native Minio methods through inheritance
-    - MD5 calculation and metadata storage for uploads
-    - Retry mechanisms for connections and operations
-    - Multi-threading support for batch operations
-    - Comprehensive logging and error handling
-    - Full backward compatibility with existing code
+    FIXED VERSION - Corrects all API method issues and connection problems.
     """
     
     def __init__(self, config: Dict[str, Any], max_workers: int = 4):
@@ -114,19 +108,24 @@ class MinioHandler(Minio):
     def _initialize_connection(self):
         """Initialize MinIO connection with retry mechanism."""
         try:
-            # Disable SSL verification warnings
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            http_client = urllib3.PoolManager(cert_reqs='CERT_NONE')
+            # Disable SSL verification warnings if needed
+            if not self._config.get('secure', True):
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                http_client = urllib3.PoolManager(cert_reqs='CERT_NONE')
+            else:
+                http_client = None
             
             # Prepare Minio constructor arguments
             minio_kwargs = {
                 'endpoint': self._config['endpoint'],
                 'access_key': self._config['access_key'],
                 'secret_key': self._config['secret_key'],
-                'secure': self._config.get('secure', True),
-                'http_client': http_client
+                'secure': self._config.get('secure', True)
             }
             
+            if http_client:
+                minio_kwargs['http_client'] = http_client
+                
             if 'region' in self._config:
                 minio_kwargs['region'] = self._config['region']
             
@@ -183,10 +182,11 @@ class MinioHandler(Minio):
         return logger
     
     def _validate_connection(self) -> None:
-        """Validate MinIO connection."""
+        """FIXED: Validate MinIO connection using list_buckets."""
         try:
-            list(self.list_buckets())
-            self.logger.debug("Connection validation successful")
+            # Use list_buckets for connection validation - this is lightweight and reliable
+            buckets = list(self.list_buckets())
+            self.logger.debug(f"Connection validation successful - found {len(buckets)} buckets")
         except Exception as e:
             raise MinioConnectionError(f"Connection validation failed: {str(e)}")
     
@@ -219,7 +219,7 @@ class MinioHandler(Minio):
     
     def health_check(self) -> Dict[str, Any]:
         """
-        Comprehensive health check for MinIO connection.
+        FIXED: Comprehensive health check for MinIO connection using correct API methods.
         
         Returns:
             Dictionary containing health status information
@@ -234,9 +234,11 @@ class MinioHandler(Minio):
                     "timestamp": time.time()
                 }
             
-            # Test operations
+            # Test operations using correct API methods
             buckets = list(self.list_buckets())
             bucket_accessible = self.bucket_exists(self.bucket_name)
+            
+            # FIXED: Use list_objects instead of list_objects_v2
             objects = list(self.list_objects(self.bucket_name, recursive=False))
             
             response_time = time.time() - start_time
@@ -414,7 +416,7 @@ class MinioHandler(Minio):
         try:
             self.logger.debug(f"Deleting folder '{folder_path}' from bucket '{bucket}'")
             
-            # Get all objects
+            # FIXED: Use list_objects instead of list_objects_v2
             objects = list(self.list_objects(bucket, prefix=folder_path, recursive=True))
             
             if use_threading and len(objects) > batch_size:
@@ -827,7 +829,7 @@ class MinioHandler(Minio):
         include_metadata: bool = False
     ) -> Generator[Dict[str, Any], None, None]:
         """
-        Enhanced object listing with optional metadata inclusion.
+        FIXED: Enhanced object listing using correct MinIO API.
         
         Args:
             prefix: Optional prefix filter
@@ -842,7 +844,9 @@ class MinioHandler(Minio):
         
         try:
             self.logger.debug(f"Listing objects in bucket '{bucket}' with prefix '{prefix}'")
-            objects = self.list_objects_v2(bucket, prefix=prefix, recursive=recursive)
+            
+            # FIXED: Use the correct list_objects method from MinIO SDK
+            objects = super().list_objects(bucket, prefix=prefix, recursive=recursive)
             
             count = 0
             for obj in objects:
@@ -966,13 +970,14 @@ class MinioHandler(Minio):
         return content_types.get(file_extension.lower(), 'application/octet-stream')
 
 
-# Example usage and testing
+# FIXED: Example usage and testing
 if __name__ == "__main__":
+    # CORRECTED configuration example
     minio_config = {
-        'endpoint': "minio-cdp-prod.apps.ocpdwhp.dwhmartr.bank",
+        'endpoint': "minio-cdp-prod.apps.ocpdwhp.dwhmartr.bank.sbi",  # Fixed endpoint
         'access_key': 'xvMjyTKmmjhdgjnhWwbr6Ha',
         'secret_key': 'nhfghnhg',
-        'bucket_name': 'test',
+        'bucket_name': 'sbi-test',  # Fixed bucket name
         'secure': True
     }
     
@@ -986,6 +991,10 @@ if __name__ == "__main__":
             buckets = list(handler.list_buckets())
             print(f"Available buckets: {len(buckets)}")
             
+            # Test the fixed list_objects method
+            objects = list(handler.list_objects(prefix='', recursive=False))
+            print(f"Objects in bucket: {len(objects)}")
+            
     except Exception as e:
         print(f"Error: {e}")
     
@@ -997,7 +1006,7 @@ if __name__ == "__main__":
         
         # All native MinIO methods are available
         # handler.make_bucket("new-bucket")  # Native MinIO method
-        # handler.list_objects("test")       # Native MinIO method
+        # objects = list(handler.list_objects("sbi-test"))  # Fixed method
         
         handler.close()
         

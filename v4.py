@@ -2,8 +2,7 @@ import os
 import io
 import logging
 import time
-from typing import Dict, Any, List, Optional, Union
-from typing import Sequence
+from typing import Dict, Any, List, Optional, Union, Sequence
 
 import pandas as pd
 import oracledb
@@ -14,11 +13,12 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 # External dependency expected by the caller's environment
 from minio_handler import MinioHandler
+from cdp_diapi_adapter import get_system_config
 
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("Minio_framework")
 
 # -----------------------------------------------------------------------------
 # Constants & TZ
@@ -32,31 +32,44 @@ IST = pytz.timezone("Asia/Kolkata")
 # -----------------------------------------------------------------------------
 def load_config_from_yaml(yaml_path: str) -> Dict[str, Any]:
     """Load configuration from YAML file."""
-    with open(yaml_path, 'r') as f:
+    with open(yaml_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
 # -----------------------------------------------------------------------------
-# DB Helpers
+# FIXED: DB Helpers with proper error raising
 # -----------------------------------------------------------------------------
 def connect_to_oracle(oracle_conf: Dict[str, Any]) -> oracledb.Connection:
-    """Connect to Oracle database with retry logic (3 attempts)."""
+    """
+    FIXED: Connect to Oracle database with retry logic and RAISE error after all attempts fail.
+    This ensures Airflow detects the failure properly.
+    """
     logger.debug("Connecting to Oracle DB")
     attempt = 0
     last_err: Optional[Exception] = None
+    
     while attempt < 3:
         try:
-            return oracledb.connect(
-                user=oracle_conf["user"],
+            conn = oracledb.connect(
+                user=oracle_conf.get("username", oracle_conf.get("user", "")),
                 password=oracle_conf["password"],
                 dsn=oracle_conf["dsn"],
             )
+            logger.info(f"Oracle connection successful on attempt {attempt + 1}")
+            return conn
         except Exception as e:
             attempt += 1
             last_err = e
             logger.error("[Connection Attempt %s] Oracle connect failed: %s", attempt, str(e))
-            time.sleep(5)
-    assert last_err is not None
-    raise last_err
+            if attempt < 3:  # Don't sleep after last attempt
+                time.sleep(5)
+    
+    # CRITICAL FIX: Raise exception after all retries fail
+    error_msg = f"Failed to connect to Oracle database after {attempt} attempts"
+    logger.error(error_msg)
+    if last_err:
+        raise last_err
+    else:
+        raise RuntimeError(error_msg)
 
 def close_connection(cursor, connection):
     """Close database cursor/connection safely."""
@@ -70,7 +83,7 @@ def close_connection(cursor, connection):
         logger.error("Error closing Oracle connection: %s", e)
 
 # -----------------------------------------------------------------------------
-# FIXED: Audit helpers with proper restartability
+# FIXED: Audit helpers with proper restartability and blocking updates
 # -----------------------------------------------------------------------------
 def prepare_auditing() -> Dict[str, Any]:
     """Base audit log dictionary with all expected keys present."""
@@ -80,7 +93,7 @@ def prepare_auditing() -> Dict[str, Any]:
         "task_endts": "",
         "task_exec_secs": 0,
         "business_loaddt": "",
-        "delta_column_value": None,  # Can be None for delta loads
+        "delta_column_value": None,
         "total_records": 0,
         "extraction_time": 0,
         "total_apicalls": 0,
@@ -105,17 +118,17 @@ def prepare_auditing() -> Dict[str, Any]:
         "log_path": "",
         "minio_filepath": "",
         "restart_point": 0,
-        "load_type": "delta",  # Default to delta
+        "load_type": "delta",
         "created_at_ts": None,
         "updated_at_ts": None,
     }
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type(Exception))
-def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[str, Any], aud_dt: str, 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), 
+       retry=retry_if_exception_type(Exception))
+def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[str, Any], aud_dt: str,
                                 delta_column_value: Optional[str] = None) -> None:
     """FIXED: Load existing audit record for restart - ensures single record per job."""
     
-    # Build composite key query - this ensures we get the exact record for this job
     query = f"""
         SELECT
             source_table, task_startts, task_endts, task_exec_secs, business_loaddt,
@@ -166,7 +179,6 @@ def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[s
                 "load_type"
             ]
             
-            # Update audit_log with existing values
             existing_data = dict(zip(keys, row))
             audit_log.update(existing_data)
             
@@ -179,8 +191,8 @@ def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[s
             except Exception:
                 pass
             
-            logger.info("Existing audit record found - restart_point=%s status=%s delta_value=%s", 
-                       audit_log.get("restart_point"), audit_log.get("status"), 
+            logger.info("Existing audit record found - restart_point=%s status=%s delta_value=%s",
+                       audit_log.get("restart_point"), audit_log.get("status"),
                        audit_log.get("delta_column_value"))
         else:
             logger.info("No existing audit record found - starting fresh")
@@ -192,10 +204,8 @@ def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[s
 
 def _ensure_time_fields(audit_data: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize types for time fields and booleans prior to MERGE."""
-    # boolean -> 'Y'/'N'
     audit_data["cdp_db_count_validation"] = 'Y' if audit_data.get("cdp_db_count_validation") else 'N'
 
-    # string -> datetime aware (IST) for known fields
     for k in ("task_startts", "task_endts"):
         v = audit_data.get(k)
         if isinstance(v, str) and v:
@@ -205,32 +215,33 @@ def _ensure_time_fields(audit_data: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(v, str) and v:
         audit_data["business_loaddt"] = datetime.strptime(v, "%Y-%m-%d").date()
 
-    # timestamps
     now_ist = datetime.now(IST)
     audit_data["updated_at_ts"] = now_ist
     if not audit_data.get("created_at_ts"):
         audit_data["created_at_ts"] = now_ist
     return audit_data
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type(Exception))
-def update_audit_record(config_audit: Dict[str, Any], audit_data: Dict[str, Any]) -> None:
-    """FIXED: Upsert audit row with proper composite key matching - prevents duplicates."""
+def update_audit_record_blocking(config_audit: Dict[str, Any], audit_data: Dict[str, Any], 
+                               max_attempts: int = 5, wait_seconds: int = 3) -> None:
+    """
+    FIXED: Blocking audit update - ensures completion before proceeding.
+    Will not return until audit record is successfully updated or all attempts fail.
+    """
     audit_data = _ensure_time_fields(audit_data)
-
-    # CRITICAL FIX: Proper MERGE with composite key matching
+    
     merge_sql = f"""
         MERGE INTO {config_audit['schema']}.{config_audit['audit_table']} target
         USING (
-            SELECT 
-                :source_table AS source_table, 
+            SELECT
+                :source_table AS source_table,
                 :business_loaddt AS business_loaddt,
                 :delta_column_value AS delta_column_value,
-                :load_type AS load_type 
+                :load_type AS load_type
             FROM dual
         ) src
         ON (
-            target.source_table = src.source_table 
-            AND target.business_loaddt = src.business_loaddt 
+            target.source_table = src.source_table
+            AND target.business_loaddt = src.business_loaddt
             AND (
                 (target.delta_column_value IS NULL AND src.delta_column_value IS NULL)
                 OR target.delta_column_value = src.delta_column_value
@@ -267,13 +278,13 @@ def update_audit_record(config_audit: Dict[str, Any], audit_data: Dict[str, Any]
             restart_point = :restart_point,
             updated_at_ts = :updated_at_ts
         WHEN NOT MATCHED THEN INSERT (
-            source_table, business_loaddt, delta_column_value, load_type, task_startts, task_endts, 
-            task_exec_secs, total_records, extraction_time, total_apicalls, success_apicalls, 
+            source_table, business_loaddt, delta_column_value, load_type, task_startts, task_endts,
+            task_exec_secs, total_records, extraction_time, total_apicalls, success_apicalls,
             failed_apicalls, api_failedpath, apicall_time, cdp_db_count_validation,
-            aerospike_init_record_cnt, aerospike_init_read_waittime, aerospike_record_cnt, 
-            aerospike_waittime, aerospike_error, mongodb_init_record_cnt, mongodb_record_cnt, 
-            mongodb_init_read_waittime, mongodb_waittime, mongodb_error, 
-            suspected_updates_or_blacklisted_records, difference_aero_mongo, status, log_path, 
+            aerospike_init_record_cnt, aerospike_init_read_waittime, aerospike_record_cnt,
+            aerospike_waittime, aerospike_error, mongodb_init_record_cnt, mongodb_record_cnt,
+            mongodb_init_read_waittime, mongodb_waittime, mongodb_error,
+            suspected_updates_or_blacklisted_records, difference_aero_mongo, status, log_path,
             minio_filepath, restart_point, created_at_ts, updated_at_ts
         ) VALUES (
             :source_table, :business_loaddt, :delta_column_value, :load_type, :task_startts, :task_endts,
@@ -287,49 +298,69 @@ def update_audit_record(config_audit: Dict[str, Any], audit_data: Dict[str, Any]
         )
     """
 
-    conn = connect_to_oracle(config_audit["target"])
-    cur = conn.cursor()
-    try:
-        logger.debug(
-            "Upserting audit for table=%s loaddt=%s delta_value=%s status=%s",
-            audit_data.get("source_table"), audit_data.get("business_loaddt"), 
-            audit_data.get("delta_column_value"), audit_data.get("status")
-        )
-        cur.execute(merge_sql, audit_data)
-        
-        # Check if it was an INSERT or UPDATE
-        rows_affected = cur.rowcount
-        if rows_affected == 1:
-            logger.debug("Audit record updated (existing record)")
-        elif rows_affected == 2:  # Oracle MERGE returns 2 for INSERT
-            logger.debug("Audit record inserted (new record)")
-        else:
-            logger.warning("Unexpected rows affected in audit MERGE: %s", rows_affected)
+    last_error = None
+    for attempt in range(max_attempts):
+        conn = None
+        cur = None
+        try:
+            conn = connect_to_oracle(config_audit["target"])
+            cur = conn.cursor()
             
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        logger.error("Audit upsert failed: %s", e)
-        raise
-    finally:
-        close_connection(cur, conn)
+            logger.debug(
+                "Upserting audit (attempt %s/%s) for table=%s loaddt=%s delta_value=%s status=%s",
+                attempt + 1, max_attempts, audit_data.get("source_table"), 
+                audit_data.get("business_loaddt"), audit_data.get("delta_column_value"), 
+                audit_data.get("status")
+            )
+            
+            cur.execute(merge_sql, audit_data)
+            conn.commit()
+            
+            logger.info("Audit record updated successfully on attempt %s", attempt + 1)
+            return  # Success - exit function
+            
+        except Exception as e:
+            last_error = e
+            logger.warning("Audit update failed on attempt %s/%s: %s", attempt + 1, max_attempts, e)
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            if attempt < max_attempts - 1:
+                logger.info("Waiting %s seconds before retry...", wait_seconds)
+                time.sleep(wait_seconds)
+        finally:
+            close_connection(cur, conn)
+    
+    # All attempts failed - raise error
+    error_msg = f"Audit update failed after {max_attempts} attempts"
+    logger.error(error_msg)
+    if last_error:
+        raise last_error
+    else:
+        raise RuntimeError(error_msg)
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type(Exception))
-def get_load_status_and_dates(config_audit: Dict[str, Any], source_table: str, 
+# Backward compatibility wrapper
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), 
+       retry=retry_if_exception_type(Exception))
+def update_audit_record(config_audit: Dict[str, Any], audit_data: Dict[str, Any]) -> None:
+    """Wrapper for backward compatibility - uses blocking update."""
+    update_audit_record_blocking(config_audit, audit_data)
+
+def get_load_status_and_dates(config_audit: Dict[str, Any], source_table: str,
                              current_business_loaddt: str, load_type: str = 'delta',
-                             delta_column: Optional[str] = None, 
+                             delta_column: Optional[str] = None,
                              oracle_config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """
-    FIXED: Returns list of incomplete jobs only - skips COMPLETED jobs.
-    """
+    """Returns list of incomplete jobs only - skips COMPLETED jobs."""
     if load_type == 'historic' and delta_column and oracle_config:
         return get_historic_load_status(config_audit, source_table, current_business_loaddt, delta_column, oracle_config)
     else:
         return get_delta_load_status(config_audit, source_table, current_business_loaddt)
 
-def get_delta_load_status(config_audit: Dict[str, Any], source_table: str, 
+def get_delta_load_status(config_audit: Dict[str, Any], source_table: str,
                          current_business_loaddt: str) -> List[Dict[str, Any]]:
-    """FIXED: Get delta load status - only return incomplete jobs."""
+    """Get delta load status - only return incomplete jobs."""
     query = f"""
         SELECT
             business_loaddt,
@@ -357,10 +388,7 @@ def get_delta_load_status(config_audit: Dict[str, Any], source_table: str,
         processed: List[Dict[str, Any]] = []
         
         for business_dt, status, restart_point, total_records, delta_val, load_type in rows:
-            if hasattr(business_dt, "strftime"):
-                biz_str = business_dt.strftime("%Y-%m-%d")
-            else:
-                biz_str = str(business_dt)
+            biz_str = business_dt.strftime("%Y-%m-%d") if hasattr(business_dt, "strftime") else str(business_dt)
             processed.append({
                 "business_loaddt": biz_str,
                 "status": status,
@@ -370,7 +398,6 @@ def get_delta_load_status(config_audit: Dict[str, Any], source_table: str,
                 "load_type": load_type
             })
         
-        # FIXED: Only add current date if no record exists at all (not even COMPLETED)
         if not processed:
             # Check if COMPLETED record exists
             completed_check_query = f"""
@@ -404,50 +431,71 @@ def get_delta_load_status(config_audit: Dict[str, Any], source_table: str,
     finally:
         close_connection(cur, conn)
 
-def get_historic_load_status(config_audit: Dict[str, Any], source_table: str, 
-                           current_business_loaddt: str, delta_column: str, 
+def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
+                           current_business_loaddt: str, delta_column: str,
                            oracle_config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """FIXED: Get historic load status - single delta value at a time, proper completion check."""
-    
-    # Query source table for next unprocessed delta value
-    next_delta_query = f"""
-        WITH source_deltas AS (
-            SELECT DISTINCT TO_CHAR({delta_column}, 'YYYY-MM-DD') as delta_value
-            FROM {source_table}
-            WHERE {delta_column} IS NOT NULL
-        ),
-        processed_deltas AS (
-            SELECT delta_column_value as delta_value
-            FROM {config_audit["schema"]}.{config_audit["audit_table"]}
-            WHERE source_table = :src
-              AND load_type = 'historic'
-              AND status = 'COMPLETED'
-              AND delta_column_value IS NOT NULL
-        )
-        SELECT MIN(sd.delta_value) as next_delta
-        FROM source_deltas sd
-        WHERE sd.delta_value NOT IN (SELECT delta_value FROM processed_deltas)
-        ORDER BY sd.delta_value
     """
+    FIXED: Get historic load status using parquet caching - returns SINGLE next delta to process.
+    This ensures sequential processing of all delta values.
+    """
+    file_name = f'source_delta_{source_table.replace(".", "_")}.parquet'
+    parquet_basepath = "/opt/airflow/etl_inward_files/CDP_minio/"
+    parquet_file = os.path.join(parquet_basepath, file_name)
+    os.makedirs(parquet_basepath, exist_ok=True)
     
     source_conn = None
     audit_conn = None
-    source_cur = None
-    audit_cur = None
+    
     try:
-        # Connect to source database to get next delta value
         source_conn = connect_to_oracle(oracle_config)
-        source_cur = source_conn.cursor()
         
-        source_cur.execute(next_delta_query, {"src": source_table})
-        result = source_cur.fetchone()
-        next_delta = result[0] if result and result[0] else None
+        # --- Parquet file management for delta values ---
+        if not os.path.exists(parquet_file):
+            logger.info("Parquet file %s not found. Fetching all distinct delta values.", parquet_file)
+            
+            query = f"SELECT DISTINCT {delta_column} as delta_value FROM {source_table} WHERE {delta_column} IS NOT NULL ORDER BY {delta_column}"
+            source_deltas_df = pd.read_sql(query, source_conn)
+            source_deltas_df.to_parquet(parquet_file, index=False)
+            logger.info("Saved initial distinct delta values to %s.", parquet_file)
+        else:
+            logger.debug("Parquet file %s found. Using cached delta values.", parquet_file)
+            source_deltas_df = pd.read_parquet(parquet_file)
+            
+            # Optionally refresh parquet file periodically
+            file_age_hours = (time.time() - os.path.getmtime(parquet_file)) / 3600
+            if file_age_hours > 24:  # Refresh if older than 24 hours
+                logger.info("Refreshing parquet file (age: %.1f hours)", file_age_hours)
+                query = f"SELECT DISTINCT {delta_column} as delta_value FROM {source_table} WHERE {delta_column} IS NOT NULL ORDER BY {delta_column}"
+                source_deltas_df = pd.read_sql(query, source_conn)
+                source_deltas_df.to_parquet(parquet_file, index=False)
         
-        if not next_delta:
-            logger.info("No more historic data to process for %s - all delta values completed", source_table)
+        # --- Get next delta to process ---
+        audit_conn = connect_to_oracle(config_audit["target"])
+        
+        # Get all completed deltas
+        processed_deltas_query = f"""
+            SELECT DISTINCT delta_column_value
+            FROM {config_audit["schema"]}.{config_audit["audit_table"]}
+            WHERE source_table = :src
+            AND load_type = 'historic'
+            AND status = 'COMPLETED'
+            AND delta_column_value IS NOT NULL
+        """
+        processed_deltas_df = pd.read_sql(processed_deltas_query, audit_conn, params={"src": source_table})
+        processed_deltas = set(processed_deltas_df['DELTA_COLUMN_VALUE'].astype(str).tolist()) if not processed_deltas_df.empty else set()
+        
+        # Find next unprocessed delta (in order)
+        all_deltas = source_deltas_df['DELTA_VALUE'].astype(str).tolist()
+        unprocessed_deltas = [d for d in all_deltas if d not in processed_deltas]
+        
+        if not unprocessed_deltas:
+            logger.info("All historic deltas completed for %s", source_table)
             return []
         
-        # Check audit status for this specific delta value
+        next_delta_str = unprocessed_deltas[0]  # Process oldest first
+        logger.info("Next historic delta to process: %s (remaining: %s)", next_delta_str, len(unprocessed_deltas))
+        
+        # Check audit status for this specific delta
         status_query = f"""
             SELECT
                 business_loaddt,
@@ -463,64 +511,55 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
               AND business_loaddt = TO_DATE(:current_dt, :fmt)
         """
         
-        audit_conn = connect_to_oracle(config_audit["target"])
-        audit_cur = audit_conn.cursor()
-        
-        audit_cur.execute(status_query, {
-            "src": source_table, 
-            "delta_val": next_delta, 
-            "current_dt": current_business_loaddt,
-            "fmt": ORACLE_DATE_FMT
-        })
-        
-        row = audit_cur.fetchone()
-        if row:
-            business_dt, status, restart_point, total_records, delta_val, load_type = row
-            if hasattr(business_dt, "strftime"):
-                biz_str = business_dt.strftime("%Y-%m-%d")
-            else:
-                biz_str = str(business_dt)
+        with audit_conn.cursor() as cur:
+            cur.execute(status_query, {
+                "src": source_table,
+                "delta_val": next_delta_str,
+                "current_dt": current_business_loaddt,
+                "fmt": ORACLE_DATE_FMT
+            })
             
-            # FIXED: Only return if not completed
-            if status != 'COMPLETED':
+            row = cur.fetchone()
+            if row:
+                business_dt, status, restart_point, total_records, delta_val, load_type = row
+                biz_str = business_dt.strftime("%Y-%m-%d") if hasattr(business_dt, "strftime") else str(business_dt)
+                
+                # Skip if already completed
+                if status == 'COMPLETED':
+                    logger.info("Delta %s already completed, finding next...", next_delta_str)
+                    return get_historic_load_status(config_audit, source_table, current_business_loaddt, delta_column, oracle_config)
+                
                 return [{
                     "business_loaddt": biz_str,
                     "status": status,
                     "restart_point": int(restart_point or 0),
                     "total_records": int(total_records or 0),
-                    "delta_column_value": next_delta,
+                    "delta_column_value": next_delta_str,
                     "load_type": 'historic'
                 }]
             else:
-                logger.info("Historic delta value %s already COMPLETED. Moving to next.", next_delta)
-                return []
-        else:
-            # Create new entry for this delta value
-            return [{
-                "business_loaddt": current_business_loaddt,
-                "status": "NOT_STARTED",
-                "restart_point": 0,
-                "total_records": 0,
-                "delta_column_value": next_delta,
-                "load_type": 'historic'
-            }]
-            
+                return [{
+                    "business_loaddt": current_business_loaddt,
+                    "status": "NOT_STARTED",
+                    "restart_point": 0,
+                    "total_records": 0,
+                    "delta_column_value": next_delta_str,
+                    "load_type": 'historic'
+                }]
+                
     except Exception as e:
         logger.error("Failed to get historic load status: %s", e, exc_info=True)
         raise
     finally:
-        if source_cur:
-            source_cur.close()
         if source_conn:
             source_conn.close()
-        if audit_cur:
-            audit_cur.close()
         if audit_conn:
             audit_conn.close()
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type(Exception))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), 
+       retry=retry_if_exception_type(Exception))
 def create_audit_table_if_not_exists(config_audit: Dict[str, Any]) -> None:
-    """FIXED: Create audit table with proper constraints to prevent duplicates."""
+    """Create audit table with proper constraints to prevent duplicates."""
     check_query = """
         SELECT COUNT(*)
         FROM all_tables
@@ -572,9 +611,9 @@ def create_audit_table_if_not_exists(config_audit: Dict[str, Any]) -> None:
                     created_at_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     CONSTRAINT uk_audit_composite UNIQUE (
-                        source_table, 
-                        business_loaddt, 
-                        NVL(delta_column_value, 'NULL'), 
+                        source_table,
+                        business_loaddt,
+                        NVL(delta_column_value, 'NULL'),
                         load_type
                     )
                 )
@@ -593,7 +632,6 @@ def create_audit_table_if_not_exists(config_audit: Dict[str, Any]) -> None:
             logger.info("Audit table created with proper constraints.")
         else:
             logger.info("Audit table exists. Checking for missing columns...")
-            # Check and add missing columns if needed
             try:
                 cur.execute(f"SELECT delta_column_value, load_type FROM {config_audit['schema']}.{config_audit['audit_table']} WHERE 1=0")
                 logger.info("All required columns exist in audit table.")
@@ -603,14 +641,14 @@ def create_audit_table_if_not_exists(config_audit: Dict[str, Any]) -> None:
                     cur.execute(f"ALTER TABLE {config_audit['schema']}.{config_audit['audit_table']} ADD (delta_column_value VARCHAR2(100))")
                     logger.info("Added DELTA_COLUMN_VALUE column")
                 except Exception as e:
-                    if "ORA-01430" not in str(e):  # Column already exists
+                    if "ORA-01430" not in str(e):
                         logger.warning("Could not add DELTA_COLUMN_VALUE: %s", e)
                 
                 try:
                     cur.execute(f"ALTER TABLE {config_audit['schema']}.{config_audit['audit_table']} ADD (load_type VARCHAR2(20) DEFAULT 'delta')")
                     logger.info("Added LOAD_TYPE column")
                 except Exception as e:
-                    if "ORA-01430" not in str(e):  # Column already exists
+                    if "ORA-01430" not in str(e):
                         logger.warning("Could not add LOAD_TYPE: %s", e)
                 
                 conn.commit()
@@ -622,40 +660,29 @@ def create_audit_table_if_not_exists(config_audit: Dict[str, Any]) -> None:
     finally:
         close_connection(cur, conn)
 
-def _update_audit_with_retry(config_audit: Dict[str, Any], audit_log: Dict[str, Any], retries: int = 3, backoff_seconds: int = 2) -> None:
-    """Try persisting the audit_log up to `retries` times with exponential backoff."""
-    attempt = 0
-    last_exc: Optional[Exception] = None
-    while attempt < retries:
-        try:
-            update_audit_record(config_audit, audit_log)
-            return
-        except Exception as e:
-            last_exc = e
-            attempt += 1
-            logger.warning("Audit persist attempt %s/%s failed: %s", attempt, retries, e)
-            time.sleep(backoff_seconds * (2 ** (attempt - 1)))
-    assert last_exc is not None
-    raise last_exc
-
 # -----------------------------------------------------------------------------
 # MinIO upload helper
 # -----------------------------------------------------------------------------
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), retry=retry_if_exception_type(Exception))
-def _upload_df_parquet(minio_client: MinioHandler, df: pd.DataFrame, object_path: str, compression: str = "snappy") -> None:
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), 
+       retry=retry_if_exception_type(Exception))
+def _upload_df_parquet(minio_client: MinioHandler, df: pd.DataFrame, object_path: str, 
+                      compression: str = "snappy") -> None:
     """Upload DataFrame as parquet to MinIO."""
     try:
-        return minio_client.upload_dataframe(df=df, object_path=object_path, format="parquet", compression=compression)
+        return minio_client.upload_dataframe(df=df, object_path=object_path, 
+                                           format="parquet", compression=compression)
     except AttributeError:
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
         except ImportError as e:
             raise RuntimeError("pyarrow is required for parquet upload fallback") from e
+        
         table = pa.Table.from_pandas(df)
         buf = io.BytesIO()
         pq.write_table(table, buf, compression=compression)
         data = buf.getvalue()
+        
         if hasattr(minio_client, "put_object"):
             minio_client.put_object(object_path, data, len(data), content_type="application/octet-stream")
         else:
@@ -664,8 +691,9 @@ def _upload_df_parquet(minio_client: MinioHandler, df: pd.DataFrame, object_path
 # -----------------------------------------------------------------------------
 # Path Generation Helper
 # -----------------------------------------------------------------------------
-def generate_object_path(base_path: str, business_loaddt: str, load_type: str, 
-                        delta_column_value: Optional[str] = None, sub_folder: Optional[str] = None) -> str:
+def generate_object_path(base_path: str, business_loaddt: str, load_type: str,
+                        delta_column_value: Optional[str] = None, 
+                        sub_folder: Optional[str] = None) -> str:
     """Generate object path based on load type and configuration."""
     try:
         load_dt = datetime.strptime(business_loaddt, "%Y-%m-%d")
@@ -676,11 +704,12 @@ def generate_object_path(base_path: str, business_loaddt: str, load_type: str,
     
     if load_type == 'historic':
         if delta_column_value:
-            return f"{base_path}/history/{delta_column_value}"
+            # Clean up delta value for path usage
+            clean_delta = str(delta_column_value).replace("-", "").replace(":", "").replace(" ", "")
+            return f"{base_path}/history/{clean_delta}"
         else:
             raise ValueError("delta_column_value is required for historic load type")
     else:
-        # For delta: base_path/delta/date_folder
         return f"{base_path}/delta/{date_folder}"
 
 # -----------------------------------------------------------------------------
@@ -708,7 +737,7 @@ def oracle_to_minio_parquet(
     where_clause: Optional[str] = None,
 ) -> None:
     """
-    FIXED: Enhanced extraction with proper restart handling and single audit record.
+    FIXED: Enhanced extraction with proper restart handling, blocking audit updates, and error handling.
     """
     extraction_start = datetime.now(IST)
     bucket = minio_config.get("bucket_name", "sbi-test")
@@ -717,6 +746,7 @@ def oracle_to_minio_parquet(
     effective_object_path = generate_object_path(
         base_object_path, business_loaddt, load_type, delta_column_value, sub_folder
     )
+    effective_object_path = effective_object_path.replace("//", "/")
 
     # Ensure audit table exists
     create_audit_table_if_not_exists(config_audit)
@@ -733,20 +763,20 @@ def oracle_to_minio_parquet(
         "minio_filepath": effective_object_path,
     })
 
-    # FIXED: Check for existing record and restart from there
+    # Check for existing record and restart from there
     initialize_restart_audit_log(config_audit, audit_log, business_loaddt, delta_column_value)
 
     # Use higher of provided restart_point vs audit restart_point
     start_chunk_index = max(int(restart_point or 0), int(audit_log.get("restart_point") or 0))
     total_records = int(audit_log.get("total_records") or 0)
 
-    # FIXED: Skip if already completed
+    # Skip if already completed
     if audit_log.get("status") == "COMPLETED":
-        logger.info("Job already COMPLETED for %s load_type=%s delta_value=%s. Skipping.", 
+        logger.info("Job already COMPLETED for %s load_type=%s delta_value=%s. Skipping.",
                    table_name, load_type, delta_column_value)
         return
 
-    logger.info("Starting extraction for %s on %s (load_type=%s, delta_value=%s)", 
+    logger.info("Starting extraction for %s on %s (load_type=%s, delta_value=%s)",
                table_name, business_loaddt, load_type, delta_column_value)
     logger.info("Restart chunk index: %s | total_records so far: %s", start_chunk_index, total_records)
 
@@ -791,9 +821,12 @@ def oracle_to_minio_parquet(
             
             # Generate object name based on load type
             if load_type == 'historic' and delta_column_value:
-                object_name = f"{effective_object_path}/{table_name.replace('.', '_')}_{delta_column_value}_{chunk_index:06d}.parquet"
+                clean_delta = str(delta_column_value).replace("-", "")
+                object_name = f"{effective_object_path}/{table_name.replace('.', '_')}_{clean_delta}_{chunk_index:06d}.parquet"
             else:
                 object_name = f"{effective_object_path}/{table_name.replace('.', '_')}_{chunk_index:06d}.parquet"
+            
+            object_name = object_name.replace("//", "/")
 
             # Upload parquet chunk to MinIO
             _upload_df_parquet(mclient, df_chunk, object_name, compression=compression)
@@ -812,8 +845,10 @@ def oracle_to_minio_parquet(
                 "minio_filepath": effective_object_path,
             })
 
+            # FIXED: Use blocking audit update - ensures completion before proceeding
             try:
-                _update_audit_with_retry(config_audit, audit_log, retries=3)
+                update_audit_record_blocking(config_audit, audit_log, max_attempts=5, wait_seconds=3)
+                logger.debug("Chunk %s audit update completed successfully", chunk_index)
             except Exception as e:
                 logger.error("Audit update failed after retries; deleting uploaded object: %s/%s", bucket, object_name)
                 try:
@@ -838,7 +873,7 @@ def oracle_to_minio_parquet(
             "task_exec_secs": (final_ist - extraction_start).total_seconds(),
             "extraction_time": (final_ist - extraction_start).total_seconds(),
         })
-        update_audit_record(config_audit, audit_log)
+        update_audit_record_blocking(config_audit, audit_log)
         logger.info("Completed Oracle -> MinIO parquet for %s (load_type=%s)", table_name, load_type)
 
         mclient.close()
@@ -852,7 +887,7 @@ def oracle_to_minio_parquet(
             "aerospike_error": str(e),
         })
         try:
-            _update_audit_with_retry(config_audit, audit_log, retries=3)
+            update_audit_record_blocking(config_audit, audit_log)
         except Exception as audit_err:
             logger.error("Audit update after failure also failed: %s", audit_err)
         logger.error("Oracle -> MinIO transfer failed: %s", e)
@@ -861,7 +896,7 @@ def oracle_to_minio_parquet(
         close_connection(cur, conn)
 
 # -----------------------------------------------------------------------------
-# Enhanced Orchestrator
+# FIXED: Enhanced Orchestrator with continuous historic processing
 # -----------------------------------------------------------------------------
 def process_oracle_to_minio_with_dependencies(
     oracle_config: Dict[str, Any],
@@ -879,70 +914,196 @@ def process_oracle_to_minio_with_dependencies(
     sub_folder: Optional[str] = None,
 ) -> None:
     """
-    FIXED: Enhanced driver that processes only incomplete jobs.
+    FIXED: Enhanced driver with continuous historic processing.
+    For historic loads, keeps processing until all delta values are completed.
     """
     table_name_uc = table_name.upper()
-    logger.info("Begin processing Oracle->MinIO for %s up to %s (load_type=%s)", 
+    logger.info("Begin processing Oracle->MinIO for %s up to %s (load_type=%s)",
                table_name_uc, current_business_loaddt, load_type)
 
-    dates = get_load_status_and_dates(
-        config_audit, table_name_uc, current_business_loaddt, 
-        load_type, delta_column, oracle_config if load_type == 'historic' else None
-    )
-    
-    if not dates:
-        logger.info("Nothing to process - all jobs completed or no jobs found.")
-        return
-
-    for date_info in dates:
-        biz_dt = date_info["business_loaddt"]
-        status = date_info["status"]
-        restart_point = int(date_info.get("restart_point") or 0)
-        delta_value = date_info.get("delta_column_value")
-        info_load_type = date_info.get("load_type", load_type)
+    if load_type == 'historic':
+        # FIXED: Continuous processing for historic loads
+        processed_deltas = 0
+        max_iterations = 1000  # Safety limit to prevent infinite loops
         
-        logger.info("Processing %s status=%s restart_point=%s delta_value=%s load_type=%s", 
-                   biz_dt, status, restart_point, delta_value, info_load_type)
+        for iteration in range(max_iterations):
+            dates = get_load_status_and_dates(
+                config_audit, table_name_uc, current_business_loaddt,
+                load_type, delta_column, oracle_config
+            )
+            
+            if not dates:
+                logger.info("All historic deltas completed for %s after processing %s deltas", 
+                           table_name_uc, processed_deltas)
+                break
+            
+            date_info = dates[0]  # Process one delta at a time
+            biz_dt = date_info["business_loaddt"]
+            status = date_info["status"]
+            restart_point = int(date_info.get("restart_point") or 0)
+            delta_value = date_info.get("delta_column_value")
+            
+            logger.info("Processing historic delta %s/%s: %s (status=%s, restart_point=%s)",
+                       processed_deltas + 1, "?", delta_value, status, restart_point)
 
-        try:
-            # FIXED: Skip completed jobs entirely
-            if status == "COMPLETED":
-                logger.info("Job for %s already COMPLETED. Skipping.", biz_dt)
-                continue
+            try:
+                if status == "COMPLETED":
+                    logger.info("Delta %s already COMPLETED. Moving to next.", delta_value)
+                    processed_deltas += 1
+                    continue
 
-            if status == "RUNNING":
-                logger.warning("Job for %s is RUNNING; treating as FAILED for restart.", biz_dt)
-                status = "FAILED"
+                if status == "RUNNING":
+                    logger.warning("Delta %s is RUNNING; treating as FAILED for restart.", delta_value)
+                    status = "FAILED"
 
-            if status in ("NOT_STARTED", "FAILED"):
-                effective_restart = restart_point if status == "FAILED" else 0
-                oracle_to_minio_parquet(
-                    oracle_config=oracle_config,
-                    minio_config=minio_config,
-                    config_audit=config_audit,
-                    table_name=table_name_uc,
-                    base_object_path=base_object_path,
-                    business_loaddt=biz_dt,
-                    chunk_size=chunk_size,
-                    compression=compression,
-                    order_by=order_by,
-                    restart_point=effective_restart,
-                    load_type=info_load_type,
-                    delta_column=delta_column,
-                    delta_column_value=delta_value,
-                    sub_folder=sub_folder,
-                )
-                
-        except Exception as e:
-            logger.error("Failed to process %s: %s", biz_dt, e)
-            continue
+                if status in ("NOT_STARTED", "FAILED"):
+                    effective_restart = restart_point if status == "FAILED" else 0
+                    
+                    oracle_to_minio_parquet(
+                        oracle_config=oracle_config,
+                        minio_config=minio_config,
+                        config_audit=config_audit,
+                        table_name=table_name_uc,
+                        base_object_path=base_object_path,
+                        business_loaddt=biz_dt,
+                        chunk_size=chunk_size,
+                        compression=compression,
+                        order_by=order_by,
+                        restart_point=effective_restart,
+                        load_type=load_type,
+                        delta_column=delta_column,
+                        delta_column_value=delta_value,
+                        sub_folder=sub_folder,
+                    )
+                    processed_deltas += 1
+                    logger.info("Completed processing delta %s. Checking for next delta...", delta_value)
+                    
+            except Exception as e:
+                logger.error("Failed to process historic delta %s: %s", delta_value, e)
+                raise  # Re-raise to fail the job
+        
+        if iteration >= max_iterations - 1:
+            logger.warning("Historic processing stopped after %s iterations (safety limit)", max_iterations)
+    else:
+        # Original logic for delta loads
+        dates = get_load_status_and_dates(
+            config_audit, table_name_uc, current_business_loaddt, 
+            load_type, delta_column, oracle_config if load_type == 'historic' else None
+        )
+        
+        if not dates:
+            logger.info("Nothing to process - all jobs completed or no jobs found.")
+            return
+
+        for date_info in dates:
+            biz_dt = date_info["business_loaddt"]
+            status = date_info["status"]
+            restart_point = int(date_info.get("restart_point") or 0)
+            delta_value = date_info.get("delta_column_value")
+            info_load_type = date_info.get("load_type", load_type)
+            
+            logger.info("Processing %s status=%s restart_point=%s delta_value=%s load_type=%s",
+                       biz_dt, status, restart_point, delta_value, info_load_type)
+
+            try:
+                if status == "COMPLETED":
+                    logger.info("Job for %s already COMPLETED. Skipping.", biz_dt)
+                    continue
+
+                if status == "RUNNING":
+                    logger.warning("Job for %s is RUNNING; treating as FAILED for restart.", biz_dt)
+                    status = "FAILED"
+
+                if status in ("NOT_STARTED", "FAILED"):
+                    effective_restart = restart_point if status == "FAILED" else 0
+                    oracle_to_minio_parquet(
+                        oracle_config=oracle_config,
+                        minio_config=minio_config,
+                        config_audit=config_audit,
+                        table_name=table_name_uc,
+                        base_object_path=base_object_path,
+                        business_loaddt=biz_dt,
+                        chunk_size=chunk_size,
+                        compression=compression,
+                        order_by=order_by,
+                        restart_point=effective_restart,
+                        load_type=info_load_type,
+                        delta_column=delta_column,
+                        delta_column_value=delta_value,
+                        sub_folder=sub_folder,
+                    )
+                    
+            except Exception as e:
+                logger.error("Failed to process %s: %s", biz_dt, e)
+                raise
 
     logger.info("All required processing completed for %s", table_name_uc)
 
 # -----------------------------------------------------------------------------
-# Rest of the code remains the same...
-# (process_from_config, test functions, main execution)
+# Configuration-based processor
 # -----------------------------------------------------------------------------
+def process_from_config(config: Dict[str, Any], conn_config: Dict[str, Any],
+                       current_business_loaddt: str) -> None:
+    """Process all objects defined in configuration."""
+    
+    oracle_config = conn_config.get("target", {})
+    minio_config = conn_config.get("minio", {})
+    logger.info("MinIO config: %s", {k: v for k, v in minio_config.items() if k != 'secret_key'})
+    
+    audit_config = {
+        "target": oracle_config,
+        "schema": config.get("schema", "uds"),
+        "audit_table": config.get("audit_config", {}).get("audit_table", "AIRFLOW_CDP_DIAPI_RUN_LOG"),
+    }
+    
+    for obj_config in config.get("objects", []):
+        if not obj_config.get("isactive", True):
+            logger.info("Skipping inactive object: %s", obj_config.get("db_table"))
+            continue
+            
+        table_name = f"{obj_config.get('schema', config.get('schema'))}.{obj_config['db_table']}"
+        output_path = obj_config.get("output_path", config.get("output_path"))
+        load_type = obj_config.get("load_type", "delta")
+        
+        chunk_size = obj_config.get("chunksize", config.get("chunksize", 100_000))
+        order_by = obj_config.get("ORDER_BY")
+        delta_column = obj_config.get("delta_column") if load_type == 'historic' else None
+        sub_folder = obj_config.get("sub_folder") if load_type == 'historic' else None
+        
+        logger.info("Processing object: %s (load_type=%s)", table_name, load_type)
+        
+        try:
+            process_oracle_to_minio_with_dependencies(
+                oracle_config=oracle_config,
+                minio_config=minio_config,
+                config_audit=audit_config,
+                table_name=table_name,
+                base_object_path=output_path,
+                current_business_loaddt=current_business_loaddt,
+                chunk_size=chunk_size,
+                order_by=order_by,
+                load_type=load_type,
+                delta_column=delta_column,
+                sub_folder=sub_folder,
+            )
+        except Exception as e:
+            logger.error("Failed to process %s: %s", table_name, e)
+            raise  # Re-raise to fail the Airflow task
 
-# Configuration-based processor, test functions, and main execution remain unchanged
-# ... (include all the remaining functions from your original code)
+# -----------------------------------------------------------------------------
+# Main execution
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+    
+    conn_config = get_system_config()
+    
+    config_yaml = "etl_configs/db2_to_uds_config.yml"
+    with open(config_yaml, 'r', encoding="utf-8") as f:
+        config_data = yaml.safe_load(f)["uds_to_minio"]
+    
+    current_date = datetime.now(IST).strftime("%Y-%m-%d")
+    
+    logger.info("Starting configuration-based processing")
+    process_from_config(config_data, conn_config, current_date)
+    logger.info("Processing completed successfully")

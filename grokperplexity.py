@@ -124,25 +124,63 @@ def prepare_auditing() -> Dict[str, Any]:
        retry=retry_if_exception_type(Exception))
 def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[str, Any], aud_dt: str,
                                 delta_column_value: Optional[str] = None) -> None:
-    """Load existing audit record for restart - ensures single record per job."""
+    """Load existing audit record for restart - ensures single record per job and handles cumulative values."""
     
+    # Enhanced query to get cumulative values across all runs
+    cumulative_query = f"""
+        SELECT
+            source_table, task_startts, task_endts,
+            SUM(task_exec_secs) as cumulative_exec_secs,
+            business_loaddt,
+            delta_column_value,
+            SUM(total_records) as cumulative_total_records,
+            SUM(extraction_time) as cumulative_extraction_time,
+            total_apicalls, success_apicalls, failed_apicalls,
+            api_failedpath, apicall_time,
+            cdp_db_count_validation,
+            aerospike_init_record_cnt, aerospike_init_read_waittime,
+            aerospike_record_cnt, aerospike_waittime, aerospike_error,
+            mongodb_init_record_cnt, mongodb_record_cnt,
+            mongodb_init_read_waittime, mongodb_waittime, mongodb_error,
+            suspected_updates_or_blacklisted_records,
+            difference_aero_mongo, status, log_path, minio_filepath,
+            MAX(restart_point) as last_restart_point,
+            load_type,
+            COUNT(*) as run_count
+        FROM {config_audit["schema"]}.{config_audit["audit_table"]}
+        WHERE source_table = :src
+        AND (:delta_val IS NULL OR delta_column_value = :delta_val)
+        GROUP BY
+            source_table, task_startts, task_endts, business_loaddt,
+            delta_column_value, total_apicalls, success_apicalls,
+            failed_apicalls, api_failedpath, apicall_time,
+            cdp_db_count_validation, aerospike_init_record_cnt,
+            aerospike_init_read_waittime, aerospike_record_cnt,
+            aerospike_waittime, aerospike_error, mongodb_init_record_cnt,
+            mongodb_record_cnt, mongodb_init_read_waittime,
+            mongodb_waittime, mongodb_error,
+            suspected_updates_or_blacklisted_records,
+            difference_aero_mongo, status, log_path, minio_filepath,
+            load_type
+    """
+    
+    # Get most recent record and cumulative stats
     if audit_log.get("load_type") == "historic" and delta_column_value:
         query = f"""
             SELECT
-                source_table, task_startts, task_endts, task_exec_secs, business_loaddt,
-                delta_column_value, total_records, extraction_time, total_apicalls,
-                success_apicalls, failed_apicalls, api_failedpath, apicall_time,
-                cdp_db_count_validation, aerospike_init_record_cnt, aerospike_init_read_waittime,
-                aerospike_record_cnt, aerospike_waittime, aerospike_error,
-                mongodb_init_record_cnt, mongodb_record_cnt, mongodb_init_read_waittime,
-                mongodb_waittime, mongodb_error, suspected_updates_or_blacklisted_records,
-                difference_aero_mongo, status, log_path, minio_filepath, restart_point,
-                load_type
-            FROM {config_audit["schema"]}.{config_audit["audit_table"]}
-            WHERE source_table = :src
-              AND delta_column_value = :delta_val
-              AND load_type = 'historic'
-            ORDER BY updated_at_ts DESC NULLS LAST
+                a.*, 
+                c.cumulative_exec_secs,
+                c.cumulative_total_records,
+                c.cumulative_extraction_time,
+                c.run_count
+            FROM {config_audit["schema"]}.{config_audit["audit_table"]} a
+            LEFT JOIN ({cumulative_query}) c
+            ON a.source_table = c.source_table 
+            AND a.delta_column_value = c.delta_column_value
+            WHERE a.source_table = :src
+            AND a.delta_column_value = :delta_val
+            AND a.load_type = 'historic'
+            ORDER BY a.updated_at_ts DESC NULLS LAST
             FETCH FIRST 1 ROW ONLY
         """
         params = {"src": audit_log["source_table"],
@@ -151,24 +189,27 @@ def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[s
     else:
         query = f"""
             SELECT
-                source_table, task_startts, task_endts, task_exec_secs, business_loaddt,
-                delta_column_value, total_records, extraction_time, total_apicalls,
-                success_apicalls, failed_apicalls, api_failedpath, apicall_time,
-                cdp_db_count_validation, aerospike_init_record_cnt, aerospike_init_read_waittime,
-                aerospike_record_cnt, aerospike_waittime, aerospike_error,
-                mongodb_init_record_cnt, mongodb_record_cnt, mongodb_init_read_waittime,
-                mongodb_waittime, mongodb_error, suspected_updates_or_blacklisted_records,
-                difference_aero_mongo, status, log_path, minio_filepath, restart_point,
-                load_type
-            FROM {config_audit["schema"]}.{config_audit["audit_table"]}
-            WHERE source_table = :src
-              AND business_loaddt = TO_DATE(:aud_dt, :fmt)
-              AND (
-                  (delta_column_value IS NULL AND :delta_val IS NULL) OR
-                  (delta_column_value = :delta_val)
-              )
-              AND NVL(load_type, 'delta') = :load_type
-            ORDER BY updated_at_ts DESC NULLS LAST
+                a.*, 
+                c.cumulative_exec_secs,
+                c.cumulative_total_records,
+                c.cumulative_extraction_time,
+                c.run_count
+            FROM {config_audit["schema"]}.{config_audit["audit_table"]} a
+            LEFT JOIN ({cumulative_query}) c
+            ON a.source_table = c.source_table 
+            AND a.business_loaddt = c.business_loaddt
+            AND (
+                (a.delta_column_value IS NULL AND c.delta_column_value IS NULL)
+                OR a.delta_column_value = c.delta_column_value
+            )
+            WHERE a.source_table = :src
+            AND a.business_loaddt = TO_DATE(:aud_dt, :fmt)
+            AND (
+                (a.delta_column_value IS NULL AND :delta_val IS NULL)
+                OR a.delta_column_value = :delta_val
+            )
+            AND NVL(a.load_type, 'delta') = :load_type
+            ORDER BY a.updated_at_ts DESC NULLS LAST
             FETCH FIRST 1 ROW ONLY
         """
         params = {
@@ -892,16 +933,28 @@ def oracle_to_minio_parquet(
             logger.info("Previous delta %s completed, starting new delta %s", audit_log.get("delta_column_value"), delta_column_value)
             previous_delta = audit_log.get("delta_column_value")
             completed = audit_log.get("aerospike_error") or ""
-            audit_log["aerospike_error"] = completed + ("," if completed else "") + previous_delta
+            audit_log["aerospike_error"] = completed + ("," if completed else "") + str(previous_delta or "")
+            
+            # Preserve cumulative totals for the new delta
+            previous_total = int(audit_log.get("total_records", 0))
+            previous_exec_time = float(audit_log.get("task_exec_secs", 0))
+            
             audit_log["delta_column_value"] = delta_column_value
             audit_log["business_loaddt"] = delta_column_value
             audit_log["status"] = "RUNNING"
             audit_log["restart_point"] = 0
-            audit_log["total_records"] = 0
             audit_log["task_startts"] = extraction_start.strftime(DATETIMEFORMAT)
+            # Keep cumulative values
+            audit_log["total_records"] = previous_total
+            audit_log["task_exec_secs"] = previous_exec_time
+            audit_log["extraction_time"] = previous_exec_time
+            
+            logger.info("AUDIT: Preserving cumulative totals - Records: %d, Execution time: %.2f seconds",
+                       previous_total, previous_exec_time)
+            
             update_audit_record_strict(config_audit, audit_log)
             start_chunk_index = 0
-            total_records = 0
+            total_records = previous_total  # Start from previous total
     else:
         # Normal restart or running
         start_chunk_index = max(int(restart_point or 0), int(audit_log.get("restart_point") or 0))
@@ -970,15 +1023,26 @@ def oracle_to_minio_parquet(
                 logger.error("CRITICAL: Failed to upload chunk %s to MinIO: %s", chunk_index, e)
                 raise RuntimeError(f"MinIO upload failed for chunk {chunk_index}: {e}")
 
-            # Prepare audit update
+            # Prepare audit update with cumulative totals
             now_ist = datetime.now(IST)
-            proposed_total = total_records + recs
+            current_run_recs = recs  # Records in this chunk
+            previous_total = int(audit_log.get("total_records", 0))  # Previous cumulative total
+            cumulative_total = previous_total + current_run_recs
+            
+            # Calculate cumulative execution time
+            current_run_time = (now_ist - extraction_start).total_seconds()
+            previous_exec_time = float(audit_log.get("task_exec_secs", 0))
+            cumulative_exec_time = previous_exec_time + current_run_time
+
+            logger.info("PROGRESS: Chunk %d - Current records: %d, Cumulative total: %d records", 
+                       chunk_index, current_run_recs, cumulative_total)
+            
             audit_log.update({
-                "total_records": proposed_total,
+                "total_records": cumulative_total,
                 "status": "RUNNING",
                 "task_endts": now_ist.strftime(DATETIMEFORMAT),
-                "task_exec_secs": (now_ist - extraction_start).total_seconds(),
-                "extraction_time": (now_ist - extraction_start).total_seconds(),
+                "task_exec_secs": cumulative_exec_time,
+                "extraction_time": cumulative_exec_time,  # Keep both times in sync
                 "restart_point": chunk_index + 1,
                 "minio_filepath": effective_object_path,
             })

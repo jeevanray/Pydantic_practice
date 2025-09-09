@@ -455,7 +455,7 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
                 logger.debug("Using cached parquet file %s", parquet_file)
                 source_deltas_df = pd.read_parquet(parquet_file)
         
-        all_deltas = source_deltas_df['delta_value'].astype(str).tolist()
+        all_deltas = source_deltas_df['DELTA_VALUE'].astype(str).tolist()
         last_delta = all_deltas[-1]
         if not all_deltas:
             logger.info("No delta values found for %s in Parquet file.", source_table)
@@ -532,31 +532,32 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
             # Create job entry for the next unprocessed delta
             processed_jobs: List[Dict[str, Any]] = []
             next_delta = unprocessed_deltas[0]  # Take the first unprocessed delta (sorted order)
-            
-            if next_delta == base_delta_value and base_status != 'COMPLETED':
-                # Current delta is still in progress
-                processed_jobs.append({
-                    "business_loaddt": biz_str,
-                    "status": base_status,
-                    "restart_point": base_restart_point,
-                    "total_records": base_total_records,
-                    "task_exec_secs": base_exec_secs,
-                    "extraction_time": base_extraction_time,
-                    "delta_column_value": next_delta,
-                    "load_type": 'historic'
-                })
-            else:
-                # New delta, use cumulative totals from the audit record
-                processed_jobs.append({
-                    "business_loaddt": biz_str,
-                    "status": "NOT_STARTED",
-                    "restart_point": 0,
-                    "total_records": base_total_records,  # Preserve cumulative total
-                    "task_exec_secs": base_exec_secs,
-                    "extraction_time": base_extraction_time,
-                    "delta_column_value": next_delta,
-                    "load_type": 'historic'
-                })
+
+            for delta in unprocessed_deltas:
+                if delta == base_delta_value and base_status != 'COMPLETED':
+                    # Current delta is still in progress
+                    processed_jobs.append({
+                        "business_loaddt": biz_str,
+                        "status": base_status,
+                        "restart_point": base_restart_point,
+                        "total_records": base_total_records,
+                        "task_exec_secs": base_exec_secs,
+                        "extraction_time": base_extraction_time,
+                        "delta_column_value": delta,
+                        "load_type": 'historic'
+                    })
+                else:
+                    # New delta, use cumulative totals from the audit record
+                    processed_jobs.append({
+                        "business_loaddt": biz_str,
+                        "status": "NOT_STARTED",
+                        "restart_point": 0,
+                        "total_records": base_total_records,  # Preserve cumulative total
+                        "task_exec_secs": base_exec_secs,
+                        "extraction_time": base_extraction_time,
+                        "delta_column_value": delta,
+                        "load_type": 'historic'
+                    })
             
             logger.info("STRICT: Next delta to process: %s (total_records=%d, status=%s)",
                        next_delta, base_total_records, processed_jobs[0]["status"])

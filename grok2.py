@@ -974,7 +974,8 @@ def oracle_to_minio_parquet(
             # Calculate incremental execution time for this chunk
             current_run_time = (now_ist - extraction_start).total_seconds()
             previous_exec_time = float(audit_log.get("task_exec_secs", 0))
-            cumulative_exec_time = previous_exec_time + current_run_time
+            cumulative_exec_time = previous_exec_time + float(current_run_time)
+            logger.info(f"previous_exec_time : {previous_exec_time}, current_run_time: {current_run_time}")
 
             logger.info("PROGRESS: Chunk %d - Current records: %d, Cumulative total: %d records", 
                        chunk_index, current_run_recs, cumulative_total)
@@ -1017,12 +1018,32 @@ def oracle_to_minio_parquet(
     
         # Finalize audit on success
         final_ist = datetime.now(IST)
+        current_delta_time = (final_ist - extraction_start).total_seconds()
+        previous_exec_time = float(audit_log.get("task_exec_secs", 0))
+
+        # For historic loads with multiple deltas, preserve cumulative time
+        if load_type == 'historic':
+            # Get the cumulative time from the last chunk processing update
+            cumulative_time = max(previous_exec_time, current_delta_time)
+        else:
+            # For regular delta loads, use current run time
+            cumulative_time = current_delta_time
+
         audit_log.update({
             "status": "COMPLETED",
             "task_endts": final_ist.strftime(DATETIMEFORMAT),
-            "task_exec_secs": (final_ist - extraction_start).total_seconds(),
-            "extraction_time": (final_ist - extraction_start).total_seconds(),
+            "task_exec_secs": cumulative_time,  # ✅ Preserve cumulative time
+            "extraction_time": cumulative_time,  # ✅ Preserve cumulative time
         })
+
+
+        # final_ist = datetime.now(IST)
+        # audit_log.update({
+        #     "status": "COMPLETED",
+        #     "task_endts": final_ist.strftime(DATETIMEFORMAT),
+        #     "task_exec_secs": (final_ist - extraction_start).total_seconds(),
+        #     "extraction_time": (final_ist - extraction_start).total_seconds(),
+        # })
         
         # STRICT: Final audit update must succeed
         try:

@@ -1,84 +1,62 @@
-The issue is that the `total_records` field in the audit table is not accumulating across different `delta_column_value` runs for historic loads. Instead, it’s being reset or overwritten with the current delta’s record count. The `oracle_to_minio_parquet` function partially handles cumulative totals but fails to correctly accumulate `total_records` across all delta values because the audit record is updated per delta without preserving the cumulative sum from previous deltas. The `initialize_restart_audit_log` function also doesn’t fetch cumulative totals correctly, as its query groups by `delta_column_value`, preventing a true sum across all deltas.
+You're correct that if the audit table maintains only one record per `source_table` for `load_type='historic'`, there's no need to aggregate values in `initialize_restart_audit_log` using a cumulative query. Instead, we should simply fetch the single existing record for the `source_table` and use its `total_records`, `task_exec_secs`, and `extraction_time` as the starting point, then add new values to these fields during updates in `oracle_to_minio_parquet`. This avoids unnecessary aggregation and ensures the audit record accumulates `total_records` and execution times correctly by updating the existing values rather than replacing them.
 
-To fix this, we need to modify the `initialize_restart_audit_log` function to fetch the cumulative `total_records` across all historic load runs for the same `source_table` and update the audit record update logic in `oracle_to_minio_parquet` to ensure `total_records` accumulates correctly.
+The issue in the provided code is that the `initialize_restart_audit_log` function uses a complex query with a cumulative subquery that's unnecessary for a single-record setup. Additionally, the `oracle_to_minio_parquet` function resets `total_records` and execution times when starting a new `delta_column_value`, which prevents proper accumulation.
+
+Below is the corrected version of the `initialize_restart_audit_log` function and the relevant update section in `oracle_to_minio_parquet` to fetch the single record's values and accumulate `total_records`, `task_exec_secs`, and `extraction_time` correctly.
 
 ### Changes Required
 
-#### 1. Modify `initialize_restart_audit_log` (Lines 108–192)
-Update the cumulative query to sum `total_records` across all `delta_column_value` entries for the `source_table` with `load_type='historic'`, and ensure the main query uses this cumulative total.
-
-**Replace Lines 108–192 with:**
+#### 1. Modify `initialize_restart_audit_log` (Replace Lines 1–97 from your snippet)
+Simplify the function to fetch the single audit record for the `source_table` with `load_type='historic'` without aggregation, and load its `total_records`, `task_exec_secs`, and `extraction_time` directly.
 
 ```python
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), 
        retry=retry_if_exception_type(Exception))
 def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[str, Any], aud_dt: str,
                                 delta_column_value: Optional[str] = None) -> None:
-    """Load existing audit record for restart - ensures single record per job and handles cumulative values."""
+    """Load existing audit record for restart - fetches single record for historic loads."""
     
-    # Cumulative query to get total_records across all deltas for historic loads
-    cumulative_query = f"""
-        SELECT
-            source_table,
-            SUM(total_records) as cumulative_total_records,
-            SUM(task_exec_secs) as cumulative_exec_secs,
-            SUM(extraction_time) as cumulative_extraction_time
-        FROM {config_audit["schema"]}.{config_audit["audit_table"]}
-        WHERE source_table = :src
-        AND load_type = 'historic'
-        GROUP BY source_table
-    """
-    
-    # Get most recent record and cumulative stats
-    if audit_log.get("load_type") == "historic" and delta_column_value:
+    # Query to fetch the single audit record for the source_table
+    if audit_log.get("load_type") == "historic":
         query = f"""
             SELECT
-                a.source_table, a.task_startts, a.task_endts, a.task_exec_secs, a.business_loaddt,
-                a.delta_column_value, a.total_records, a.extraction_time, a.total_apicalls,
-                a.success_apicalls, a.failed_apicalls, a.api_failedpath, a.apicall_time,
-                a.cdp_db_count_validation, a.aerospike_init_record_cnt, a.aerospike_init_read_waittime,
-                a.aerospike_record_cnt, a.aerospike_waittime, a.aerospike_error,
-                a.mongodb_init_record_cnt, a.mongodb_record_cnt, a.mongodb_init_read_waittime,
-                a.mongodb_waittime, a.mongodb_error, a.suspected_updates_or_blacklisted_records,
-                a.difference_aero_mongo, a.status, a.log_path, a.minio_filepath, a.restart_point,
-                a.load_type,
-                c.cumulative_total_records, c.cumulative_exec_secs, c.cumulative_extraction_time
-            FROM {config_audit["schema"]}.{config_audit["audit_table"]} a
-            LEFT JOIN ({cumulative_query}) c
-            ON a.source_table = c.source_table
-            WHERE a.source_table = :src
-            AND a.delta_column_value = :delta_val
-            AND a.load_type = 'historic'
-            ORDER BY a.updated_at_ts DESC NULLS LAST
+                source_table, task_startts, task_endts, task_exec_secs, business_loaddt,
+                delta_column_value, total_records, extraction_time, total_apicalls,
+                success_apicalls, failed_apicalls, api_failedpath, apicall_time,
+                cdp_db_count_validation, aerospike_init_record_cnt, aerospike_init_read_waittime,
+                aerospike_record_cnt, aerospike_waittime, aerospike_error,
+                mongodb_init_record_cnt, mongodb_record_cnt, mongodb_init_read_waittime,
+                mongodb_waittime, mongodb_error, suspected_updates_or_blacklisted_records,
+                difference_aero_mongo, status, log_path, minio_filepath, restart_point,
+                load_type
+            FROM {config_audit["schema"]}.{config_audit["audit_table"]}
+            WHERE source_table = :src
+            AND load_type = 'historic'
+            ORDER BY updated_at_ts DESC NULLS LAST
             FETCH FIRST 1 ROW ONLY
         """
-        params = {"src": audit_log["source_table"],
-                  "delta_val": delta_column_value
-                  }
+        params = {"src": audit_log["source_table"]}
     else:
         query = f"""
             SELECT
-                a.source_table, a.task_startts, a.task_endts, a.task_exec_secs, a.business_loaddt,
-                a.delta_column_value, a.total_records, a.extraction_time, a.total_apicalls,
-                a.success_apicalls, a.failed_apicalls, a.api_failedpath, a.apicall_time,
-                a.cdp_db_count_validation, a.aerospike_init_record_cnt, a.aerospike_init_read_waittime,
-                a.aerospike_record_cnt, a.aerospike_waittime, a.aerospike_error,
-                a.mongodb_init_record_cnt, a.mongodb_record_cnt, a.mongodb_init_read_waittime,
-                a.mongodb_waittime, a.mongodb_error, a.suspected_updates_or_blacklisted_records,
-                a.difference_aero_mongo, a.status, a.log_path, a.minio_filepath, a.restart_point,
-                a.load_type,
-                c.cumulative_total_records, c.cumulative_exec_secs, c.cumulative_extraction_time
-            FROM {config_audit["schema"]}.{config_audit["audit_table"]} a
-            LEFT JOIN ({cumulative_query}) c
-            ON a.source_table = c.source_table
-            WHERE a.source_table = :src
-            AND a.business_loaddt = TO_DATE(:aud_dt, :fmt)
+                source_table, task_startts, task_endts, task_exec_secs, business_loaddt,
+                delta_column_value, total_records, extraction_time, total_apicalls,
+                success_apicalls, failed_apicalls, api_failedpath, apicall_time,
+                cdp_db_count_validation, aerospike_init_record_cnt, aerospike_init_read_waittime,
+                aerospike_record_cnt, aerospike_waittime, aerospike_error,
+                mongodb_init_record_cnt, mongodb_record_cnt, mongodb_init_read_waittime,
+                mongodb_waittime, mongodb_error, suspected_updates_or_blacklisted_records,
+                difference_aero_mongo, status, log_path, minio_filepath, restart_point,
+                load_type
+            FROM {config_audit["schema"]}.{config_audit["audit_table"]}
+            WHERE source_table = :src
+            AND business_loaddt = TO_DATE(:aud_dt, :fmt)
             AND (
-                (a.delta_column_value IS NULL AND :delta_val IS NULL)
-                OR a.delta_column_value = :delta_val
+                (delta_column_value IS NULL AND :delta_val IS NULL)
+                OR delta_column_value = :delta_val
             )
-            AND NVL(a.load_type, 'delta') = :load_type
-            ORDER BY a.updated_at_ts DESC NULLS LAST
+            AND NVL(load_type, 'delta') = :load_type
+            ORDER BY updated_at_ts DESC NULLS LAST
             FETCH FIRST 1 ROW ONLY
         """
         params = {
@@ -104,7 +82,7 @@ def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[s
                     "mongodb_init_record_cnt", "mongodb_record_cnt", "mongodb_init_read_waittime",
                     "mongodb_waittime", "mongodb_error", "suspected_updates_or_blacklisted_records",
                     "difference_aero_mongo", "status", "log_path", "minio_filepath", "restart_point",
-                    "load_type", "cumulative_total_records", "cumulative_exec_secs", "cumulative_extraction_time"
+                    "load_type"
                 ]
                 
                 existing_data = dict(zip(keys, row))
@@ -119,12 +97,7 @@ def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[s
                 except Exception:
                     pass
                 
-                # Use cumulative total_records if available
-                if existing_data.get("cumulative_total_records") is not None:
-                    audit_log["total_records"] = int(existing_data["cumulative_total_records"] or 0)
-                    logger.info("Loaded cumulative total_records: %d", audit_log["total_records"])
-                
-                logger.info("Existing audit record found - restart_point=%s status=%s delta_value=%s cumulative_records=%s",
+                logger.info("Existing audit record found - restart_point=%s status=%s delta_value=%s total_records=%s",
                            audit_log.get("restart_point"), audit_log.get("status"),
                            audit_log.get("delta_column_value"), audit_log.get("total_records"))
             else:
@@ -132,12 +105,12 @@ def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[s
 ```
 
 **Explanation**:
-- The `cumulative_query` now sums `total_records`, `task_exec_secs`, and `extraction_time` across all historic load records for the `source_table`, regardless of `delta_column_value`.
-- The main query joins with this to fetch the cumulative `total_records` and sets it in `audit_log["total_records"]` when a record exists.
-- This ensures `total_records` starts with the sum of all previous deltas’ records.
+- For `load_type='historic'`, the query fetches the single audit record for the `source_table` without filtering by `delta_column_value`, as there’s only one record.
+- The fetched `total_records`, `task_exec_secs`, and `extraction_time` are loaded into `audit_log` as the starting point.
+- The delta load case remains unchanged to maintain compatibility.
 
 #### 2. Modify `oracle_to_minio_parquet` (Lines 882–904, new delta block)
-Update the new delta block to use the cumulative `total_records` and avoid resetting it.
+Update the new delta block to preserve and accumulate `total_records`, `task_exec_secs`, and `extraction_time` from the existing audit record.
 
 **Replace Lines 882–904 with:**
 
@@ -171,11 +144,11 @@ Update the new delta block to use the cumulative `total_records` and avoid reset
 ```
 
 **Explanation**:
-- Ensures `total_records` is not reset to 0 when starting a new delta; it uses the cumulative total loaded from `initialize_restart_audit_log`.
-- Preserves `task_exec_secs` and `extraction_time` to maintain continuity.
+- Retains the existing `total_records`, `task_exec_secs`, and `extraction_time` from the audit record instead of resetting them.
+- Updates `delta_column_value` and `business_loaddt` for the new delta while keeping cumulative values intact.
 
 #### 3. Modify `oracle_to_minio_parquet` Chunk Loop (Lines 964–983)
-Update the chunk loop to correctly accumulate `total_records` and execution times.
+Update the chunk loop to add new records and execution time to the existing totals.
 
 **Replace Lines 964–983 with:**
 
@@ -206,12 +179,11 @@ Update the chunk loop to correctly accumulate `total_records` and execution time
 ```
 
 **Explanation**:
-- Uses `len(df_chunk)` for `current_run_recs` to ensure accurate record counting.
-- Adds `current_run_recs` to `previous_total` to maintain a cumulative `total_records`.
-- Accumulates `task_exec_secs` and `extraction_time` incrementally to reflect total time across chunks and deltas.
+- Adds `current_run_recs` (from `len(df_chunk)`) to `previous_total` to accumulate `total_records`.
+- Adds `current_run_time` to `previous_exec_time` to accumulate `task_exec_secs` and `extraction_time`.
 
 #### 4. Fix Variable Reference (Line 987)
-The line `total_records = proposed_total` references an undefined variable. Replace it with the correct variable.
+Correct the undefined `proposed_total` variable.
 
 **Replace Line 987 with:**
 
@@ -220,10 +192,15 @@ The line `total_records = proposed_total` references an undefined variable. Repl
 ```
 
 **Explanation**:
-- Corrects the variable reference to use `cumulative_total` from the audit update.
+- Uses `cumulative_total` to update `total_records` after a successful audit update.
 
-### Notes
-- **Impact**: These changes ensure `total_records` accumulates across all `delta_column_value` runs for a `source_table` with `load_type='historic'`. The `initialize_restart_audit_log` function fetches the sum of `total_records` from all historic load records, and the chunk loop adds to this cumulative total.
-- **Testing**: Verify by running a historic load with multiple `delta_column_value` values (e.g., `2023-05-14`, `2023-05-15`). Check the audit table to confirm `total_records` reflects the sum of records across all deltas, not just the current delta.
-- **Debugging**: Add logging in the chunk loop to confirm `current_run_recs > 0`. If `total_records` still doesn’t increase, ensure `df_chunk` contains rows (i.e., the query is returning data).
-- **No Other Changes**: The rest of the code (e.g., skipping logic, MinIO uploads) remains unchanged as it’s working correctly per your description.
+### Additional Notes
+- **Single Record Assumption**: These changes assume the audit table has only one record per `source_table` for `load_type='historic'`, as you indicated. The `initialize_restart_audit_log` function fetches this record directly without aggregating across multiple records.
+- **Testing**: Run a historic load for `UDS.RETAIL_GDM_CUST_DIM` with multiple `delta_column_value` values (e.g., `2023-05-14`, `2023-05-15`). Check the audit table to confirm that `total_records` increases with each delta (e.g., if `2023-05-14` processes 1000 rows and `2023-05-15` processes 500 rows, `total_records` should be 1500 after both). Verify `task_exec_secs` and `extraction_time` also accumulate.
+- **Debugging**: If `total_records` still doesn’t increase, add a log statement before `len(df_chunk)` to confirm `rows` is not empty:
+  ```python
+  logger.debug("Fetched %d rows for chunk %d", len(rows), chunk_index)
+  ```
+  If `rows` is empty, check the `select_sql` query for issues (e.g., incorrect `delta_column_value` or no matching data).
+- **No Other Changes**: Only the audit update logic is modified, as requested, to ensure the rest of the code (which is working) remains untouched.
+- **Audit Table Constraint**: The existing `uk_audit_composite` constraint in `create_audit_table_if_not_exists` (Line 614) ensures a single record for `load_type='historic'` by making `business_loaddt` and `delta_column_value` NULL, enforcing one record per `source_table`. This aligns with your single-record assumption.

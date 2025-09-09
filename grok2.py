@@ -427,7 +427,7 @@ def update_audit_record(config_audit: Dict[str, Any], audit_data: Dict[str, Any]
     """Wrapper for backward compatibility - uses strict blocking update."""
     update_audit_record_strict(config_audit, audit_data)
 
-# FIXED: Historic load status that returns all incomplete deltas to process in sequence
+Historic load status that returns all incomplete deltas to process in sequence
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), 
        retry=retry_if_exception_type(Exception))
 def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
@@ -445,17 +445,19 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
     try:
         # --- Load distinct delta values from Parquet or refresh from source ---
         with connect_to_oracle(oracle_config) as source_conn:
-            if not os.path.exists(parquet_file) or (time.time() - os.path.getmtime(parquet_file)) > 86400:  # Refresh if older than 1 day
+            if not os.path.exists(parquet_file): # or (time.time() - os.path.getmtime(parquet_file)) > 86400:  # Refresh if older than 1 day
                 logger.info("Parquet file %s not found or outdated. Refreshing all distinct delta values.", parquet_file)
                 query = f"SELECT DISTINCT {delta_column} as delta_value FROM {source_table} WHERE {delta_column} IS NOT NULL ORDER BY {delta_column}"
                 source_deltas_df = pd.read_sql(query, source_conn)
                 source_deltas_df.to_parquet(parquet_file, index=False)
                 logger.info("Saved refreshed distinct delta values to %s.", parquet_file)
+
             else:
                 logger.debug("Using cached parquet file %s", parquet_file)
                 source_deltas_df = pd.read_parquet(parquet_file)
         
         all_deltas = source_deltas_df['delta_value'].astype(str).tolist()
+        last_delta = all_deltas[-1]
         if not all_deltas:
             logger.info("No delta values found for %s in Parquet file.", source_table)
             return []
@@ -482,7 +484,6 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
             cur = audit_conn.cursor()
             cur.execute(processed_deltas_query, {"src": source_table})
             row = cur.fetchone()
-            completed_deltas = set()
             base_status = "NOT_STARTED"
             base_restart_point = 0
             base_total_records = 0
@@ -495,9 +496,6 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
                 business_dt, status, restart_point, total_records, delta_val, load_type, task_exec_secs, extraction_time, aerospike_error = row
                 if isinstance(aerospike_error, oracledb.LOB):
                     aerospike_error = aerospike_error.read()
-                completed_deltas = set(aerospike_error.split(',') if aerospike_error else [])
-                if status == 'COMPLETED' and delta_val:
-                    completed_deltas.add(delta_val)
                 base_status = status
                 base_restart_point = int(restart_point or 0)
                 base_total_records = int(total_records or 0)
@@ -507,7 +505,24 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
                 biz_str = business_dt.strftime("%Y-%m-%d") if hasattr(business_dt, "strftime") else str(business_dt)
             
             # Find all unprocessed deltas in sorted order
-            unprocessed_deltas = [d for d in all_deltas if d not in completed_deltas]
+            try:
+                processed_index = all_deltas.index(base_delta_value)
+            except ValueError:
+                processed_index = -1
+            unprocessed_deltas = all_deltas[processed_index+1:]
+
+            if last_delta not in unprocessed_deltas:
+                try:
+                    with connect_to_oracle(oracle_config) as source_conn:
+                            logger.info("Parquet file %s outdated. Refreshing all distinct delta values.", parquet_file)
+                            query = f"SELECT DISTINCT {delta_column} as delta_value FROM {source_table} WHERE {delta_column} IS NOT NULL ORDER BY {delta_column}"
+                            source_deltas_df = pd.read_sql(query, source_conn)
+                            source_deltas_df.to_parquet(parquet_file, index=False)
+                            logger.info("Saved refreshed distinct delta values to %s.", parquet_file)
+
+                except Exception  as e:
+                    logger.error("Could not refresh the parquet file for delta_value")
+                    raise e
             
             if not unprocessed_deltas:
                 logger.info("All historic deltas completed for %s", source_table)

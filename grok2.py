@@ -427,7 +427,6 @@ def update_audit_record(config_audit: Dict[str, Any], audit_data: Dict[str, Any]
     """Wrapper for backward compatibility - uses strict blocking update."""
     update_audit_record_strict(config_audit, audit_data)
 
-Historic load status that returns all incomplete deltas to process in sequence
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), 
        retry=retry_if_exception_type(Exception))
 def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,

@@ -428,12 +428,14 @@ def update_audit_record(config_audit: Dict[str, Any], audit_data: Dict[str, Any]
     update_audit_record_strict(config_audit, audit_data)
 
 # FIXED: Historic load status that returns all incomplete deltas to process in sequence
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), 
+       retry=retry_if_exception_type(Exception))
 def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
                            current_business_loaddt: str, delta_column: str,
                            oracle_config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    FIXED: Get historic load status - uses a single audit record for all delta values,
-           updating the same record until all deltas are processed.
+    FIXED: Get historic load status - uses a single audit record, tracks completed deltas,
+           and selects the next unprocessed delta from the sorted Parquet file.
     """
     file_name = f'source_delta_{source_table.replace(".", "_")}.parquet'
     parquet_basepath = "/opt/airflow/etl_inward_files/CDP_minio/"
@@ -441,7 +443,7 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
     os.makedirs(parquet_basepath, exist_ok=True)
     
     try:
-        # --- Parquet file management for delta values with refresh ---
+        # --- Load distinct delta values from Parquet or refresh from source ---
         with connect_to_oracle(oracle_config) as source_conn:
             if not os.path.exists(parquet_file) or (time.time() - os.path.getmtime(parquet_file)) > 86400:  # Refresh if older than 1 day
                 logger.info("Parquet file %s not found or outdated. Refreshing all distinct delta values.", parquet_file)
@@ -453,9 +455,12 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
                 logger.debug("Using cached parquet file %s", parquet_file)
                 source_deltas_df = pd.read_parquet(parquet_file)
         
-        all_deltas = source_deltas_df['DELTA_VALUE'].astype(str).tolist()
+        all_deltas = source_deltas_df['delta_value'].astype(str).tolist()
+        if not all_deltas:
+            logger.info("No delta values found for %s in Parquet file.", source_table)
+            return []
         
-        # --- Get all COMPLETED deltas from the single audit record's aerospike_error field ---
+        # --- Get the single audit record for completed deltas and status ---
         with connect_to_oracle(config_audit["target"]) as audit_conn:
             processed_deltas_query = f"""
                 SELECT
@@ -465,6 +470,8 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
                     NVL(total_records, 0) AS total_records,
                     delta_column_value,
                     NVL(load_type, 'historic') AS load_type,
+                    NVL(task_exec_secs, 0) AS task_exec_secs,
+                    NVL(extraction_time, 0) AS extraction_time,
                     aerospike_error
                 FROM {config_audit["schema"]}.{config_audit["audit_table"]}
                 WHERE source_table = :src
@@ -479,54 +486,66 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
             base_status = "NOT_STARTED"
             base_restart_point = 0
             base_total_records = 0
+            base_exec_secs = 0
+            base_extraction_time = 0
             base_delta_value = None
             biz_str = current_business_loaddt
             
             if row:
-                business_dt, status, restart_point, total_records, delta_val, load_type, aerospike_error = row
+                business_dt, status, restart_point, total_records, delta_val, load_type, task_exec_secs, extraction_time, aerospike_error = row
                 if isinstance(aerospike_error, oracledb.LOB):
                     aerospike_error = aerospike_error.read()
                 completed_deltas = set(aerospike_error.split(',') if aerospike_error else [])
-                if status == 'COMPLETED':
+                if status == 'COMPLETED' and delta_val:
                     completed_deltas.add(delta_val)
                 base_status = status
                 base_restart_point = int(restart_point or 0)
                 base_total_records = int(total_records or 0)
+                base_exec_secs = float(task_exec_secs or 0)
+                base_extraction_time = float(extraction_time or 0)
                 base_delta_value = delta_val
                 biz_str = business_dt.strftime("%Y-%m-%d") if hasattr(business_dt, "strftime") else str(business_dt)
             
-            # Find all unprocessed deltas (in order)
+            # Find all unprocessed deltas in sorted order
             unprocessed_deltas = [d for d in all_deltas if d not in completed_deltas]
             
             if not unprocessed_deltas:
                 logger.info("All historic deltas completed for %s", source_table)
                 return []
             
-            logger.info("Found %s unprocessed deltas for processing.", len(unprocessed_deltas))
+            logger.info("Found %s unprocessed deltas for processing: %s", len(unprocessed_deltas), unprocessed_deltas)
             
-            # Create job entries for each unprocessed delta, using the same audit record
+            # Create job entry for the next unprocessed delta
             processed_jobs: List[Dict[str, Any]] = []
-            for delta_val in unprocessed_deltas:
-                if delta_val == base_delta_value and base_status != 'COMPLETED':
-                    processed_jobs.append({
-                        "business_loaddt": biz_str,
-                        "status": base_status,
-                        "restart_point": base_restart_point,
-                        "total_records": base_total_records,
-                        "delta_column_value": delta_val,
-                        "load_type": 'historic'
-                    })
-                else:
-                    processed_jobs.append({
-                        "business_loaddt": biz_str,
-                        "status": "NOT_STARTED",
-                        "restart_point": 0,
-                        "total_records": base_total_records,  # Use existing total for new deltas
-                        "delta_column_value": delta_val,
-                        "load_type": 'historic'
-                    })
+            next_delta = unprocessed_deltas[0]  # Take the first unprocessed delta (sorted order)
             
-            logger.info("STRICT: %s historic jobs to process (remaining deltas: %s)", len(processed_jobs), len(unprocessed_deltas))
+            if next_delta == base_delta_value and base_status != 'COMPLETED':
+                # Current delta is still in progress
+                processed_jobs.append({
+                    "business_loaddt": biz_str,
+                    "status": base_status,
+                    "restart_point": base_restart_point,
+                    "total_records": base_total_records,
+                    "task_exec_secs": base_exec_secs,
+                    "extraction_time": base_extraction_time,
+                    "delta_column_value": next_delta,
+                    "load_type": 'historic'
+                })
+            else:
+                # New delta, use cumulative totals from the audit record
+                processed_jobs.append({
+                    "business_loaddt": biz_str,
+                    "status": "NOT_STARTED",
+                    "restart_point": 0,
+                    "total_records": base_total_records,  # Preserve cumulative total
+                    "task_exec_secs": base_exec_secs,
+                    "extraction_time": base_extraction_time,
+                    "delta_column_value": next_delta,
+                    "load_type": 'historic'
+                })
+            
+            logger.info("STRICT: Next delta to process: %s (total_records=%d, status=%s)",
+                       next_delta, base_total_records, processed_jobs[0]["status"])
             return processed_jobs
                 
     except Exception as e:

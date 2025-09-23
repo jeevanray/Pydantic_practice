@@ -1,0 +1,315 @@
+CREATE TABLE minio.segmentdb_6550.ds_demographics_limit (
+    CUST_NBR VARCHAR,
+    CUST_NBR_CHKDGT VARCHAR,
+    CIF VARCHAR,
+    CUST_TYP_CD VARCHAR,
+    HOME_BRCH_NBR VARCHAR,
+    TIER_CUST_TYP VARCHAR,
+    CUST_STS VARCHAR,
+    LNG_CD VARCHAR,
+    VIP_CD VARCHAR,
+    BRTH_DT TIMESTAMP(6),
+    CUST_RSK_GRD VARCHAR,
+    GNDR_CD VARCHAR,
+    OFC_ADDR_LN_1 VARCHAR,
+    OFC_ADDR_LN_2 VARCHAR,
+    OCCUPNCY_CD VARCHAR,
+    OFC_PST_CD VARCHAR,
+    FRST_NM VARCHAR,
+    MID_NM VARCHAR,
+    LST_NM VARCHAR,
+    FULL_NM VARCHAR,
+    MOBILE_NBR VARCHAR,
+    STATE_CD VARCHAR,
+    EMAIL_ADDR_1 VARCHAR,
+    EMAIL_ADDR_2 VARCHAR,
+    DEATH_DT TIMESTAMP(6),
+    EMP_FROM_DT TIMESTAMP(6),
+    SHRT_NM VARCHAR,
+    EMPLYR_NM VARCHAR,
+    AUD_LOAD_TS TIMESTAMP(6),
+    AUD_DT TIMESTAMP(6),
+    EXPRY_DT TIMESTAMP(6),
+    UDS_LOAD_TS TIMESTAMP(6),
+    VALID_MOBILE_NO VARCHAR,
+    MOBILE_NO_VALID_FLG VARCHAR,
+    EMAIL VARCHAR,
+    EMAIL_VALID_FLG VARCHAR
+)
+WITH (
+    format = 'PARQUET',
+    format_version = 2,
+    location = 's3a://sbi-test/segmentation/segmentdb_6550/ds_demographics_limit/',
+    max_commit_retry = 4
+);
+
+ALTER TABLE minio.segmentdb_6550.ds_demographics_limit
+EXECUTE add_files(
+  location => 's3a://sbi-test/segmentation/segmentdb_6550/input_data/customer_data/customer_profile/03092025',
+  format => 'PARQUET'
+);
+
+
+CREATE TABLE minio.segmentdb_6550.ds_demographics_limit (
+   customer_id varchar,
+   first_name varchar,
+   middle_name varchar,
+   last_name varchar,
+   name_prefix varchar,
+   name_suffix varchar,
+   phone_number varchar,
+   email_address varchar,
+   addr_line_1 varchar,
+   addr_line_2 varchar,
+   city varchar,
+   state varchar,
+   country varchar,
+   zipcode varchar,
+   gender varchar,
+   age double,
+   maritalstatus varchar,
+   occupation varchar,
+   educationlevel varchar,
+   incomelevel varchar,
+   valuesandbeliefs varchar,
+   lifestylepreferences varchar,
+   interestsandhobbies varchar,
+   buyingmotivations varchar,
+   personalitytraits varchar,
+   accountnumber varchar,
+   accountbalance double,
+   acct_type array(varchar),
+   card_type array(varchar),
+   product_holding array(varchar),
+   closed_products array(varchar),
+   acc_card_close_date array(varchar),
+   masked_card_no array(varchar),
+   card_variant_product_name array(varchar),
+   card_product_name array(varchar),
+   product_name array(varchar),
+   ct_encrypted_id varchar
+)
+WITH (
+   format = 'PARQUET',
+   format_version = 2,
+   location = 's3a://sbi-test/segmentation/segmentdb_6550/ds_demographics_limit',
+   max_commit_retry = 4
+)
+
+
+
+
+
+CREATE TABLE minio.segmentdb_6550.ds_conversions_limit (
+   campaignname varchar,
+   campaigncode varchar,
+   offercode varchar,
+   offername varchar,
+   customerid varchar,
+   responsetype varchar,
+   responsechannel varchar,
+   responsedatetime timestamp(6),
+   cost double,
+   product varchar,
+   revenue double,
+   treatmentcode varchar,
+   eventtype varchar,
+   date varchar,
+   time varchar,
+   advid varchar,
+   year varchar,
+   month varchar,
+   day varchar
+)
+WITH (
+   format = 'PARQUET',
+   format_version = 2,
+   location = 's3a://sbi-test/segmentation/segmentdb_6550/ds_conversions_limit',
+   max_commit_retry = 4
+)
+
+
+
+
+
+CREATE TABLE minio.segmentdb_6550.ds_transactions_limit (
+   mer_id varchar,
+   cod_mcc varchar,
+   cr_dr varchar,
+   txn_amount double,
+   txn_date timestamp(6),
+   particulars varchar,
+   encrypted_customerid varchar,
+   advid varchar,
+   year varchar,
+   month varchar,
+   day varchar
+)
+WITH (
+   format = 'PARQUET',
+   format_version = 2,
+   location = 's3a://sbi-test/segmentation/segmentdb_6550/ds_transactions_limit',
+   max_commit_retry = 4
+)
+
+
+
+
+CREATE TABLE minio.segmentdb_6550.ds_unicach_limit (
+   encrypted_customerid varchar,
+   responsedatetime timestamp(6),
+   actualreasoncode varchar,
+   reasoncode varchar,
+   responsechannel varchar,
+   actualchannel varchar,
+   vendor varchar,
+   campaigncode varchar,
+   campaignname varchar,
+   offercode varchar,
+   offername varchar,
+   product varchar,
+   treatmentcode varchar,
+   success_flg varchar,
+   ma_source varchar,
+   cost double,
+   advid varchar,
+   year varchar,
+   month varchar,
+   day varchar
+)
+WITH (
+   format = 'PARQUET',
+   format_version = 2,
+   location = 's3a://sbi-test/segmentation/segmentdb_6550/ds_unicach_limit',
+   max_commit_retry = 4
+)
+
+
+
+CREATE TABLE minio.segmentdb_6550.ctevents_iceberg_with_partation_v2 (
+   properties map(varchar, varchar),
+   eventname varchar,
+   eventdate timestamp(6),
+   eventtime varchar,
+   un_enc_cust_id varchar,
+   ct_encrypted_id varchar
+)
+WITH (
+   format = 'PARQUET',
+   format_version = 2,
+   location = 's3a://sbi-test/segmentation/segmentdb_6550/ct_iceWith_partation_v2',
+   max_commit_retry = 4,
+   partitioning = ARRAY['eventname']
+)
+
+
+
+-----------------------------------------------------------------------------------------------------------------
+
+ALTER TABLE minio.segmentdb_6550.ds_demographics_limit
+EXECUTE add_files(
+  location => 's3a://sbi-test/segmentation/segmentdb_6550/demographicsData/batch3',
+  format => 'PARQUET'
+);
+
+
+-----------------------------------------------------------------------------------------------------------------
+
+
+CREATE TABLE minio.segmentdb_6550.ctevents_stage_batch1 (
+   properties map(varchar, varchar),
+   eventname varchar,
+   eventdate timestamp(6),
+   eventtime varchar,
+   un_enc_cust_id varchar,
+   ct_encrypted_id varchar
+)
+WITH (
+   location = 's3a://sbi-test/segmentation/segmentdb_6550/temp_ctevents',
+   format = 'PARQUET'
+);
+
+ALTER TABLE minio.segmentdb_6550.ctevents_stage_batch1
+EXECUTE add_files(
+  location => 's3a://sbi-test/segmentation/segmentdb_6550/cteventsdata/updatedbatch1',
+  format => 'PARQUET'
+);
+
+
+INSERT INTO minio.segmentdb_6550.ctevents_iceberg_with_partation_v2
+SELECT * FROM minio.segmentdb_6550.ctevents_stage_batch1;
+
+
+-----------------------------------------------------------------------------------------------------------------
+
+CREATE TABLE hive.default.segmentationmetadata03 (
+   advid varchar,
+   datasourcename varchar,
+   dimension varchar,
+   datatype varchar,
+   dbtype varchar,
+   dbname varchar,
+   tablecollectionname varchar,
+   isenumerable varchar,
+   primaryidentifier varchar,
+   display_dimensions varchar,
+   display_datasourcename varchar,
+   cteventidentifier varchar,
+   propertiesidentifier varchar,
+   isrts varchar,
+   cteventdateidentifier varchar
+)
+WITH (
+   external_location = 's3a://bgs-out-athena/segmentationmetadata_latest',
+   format = 'CSV',
+   skip_header_line_count = 1
+)
+
+
+
+CREATE VIEW minio.segmentdb_6550.segmentationmetadata SECURITY DEFINER AS
+SELECT
+  advid
+, datasourcename
+, dimension
+, datatype
+, dbtype
+, dbname
+, tablecollectionname
+, (CASE WHEN (LOWER(trim(BOTH FROM isenumerable)) IN ('true', '1', 'yes')) THEN true ELSE false END) isenumerable
+, (CASE WHEN (LOWER(trim(BOTH FROM primaryidentifier)) IN ('true', '1', 'yes')) THEN true ELSE false END) primaryidentifier
+, display_dimensions
+, display_datasourcename
+, (CASE WHEN (LOWER(trim(BOTH FROM cteventidentifier)) IN ('true', '1', 'yes')) THEN true ELSE false END) cteventidentifier
+, (CASE WHEN (LOWER(trim(BOTH FROM propertiesidentifier)) IN ('true', '1', 'yes')) THEN true ELSE false END) propertiesidentifier
+, isrts
+, (CASE WHEN (LOWER(trim(BOTH FROM cteventdateidentifier)) IN ('true', '1', 'yes')) THEN true ELSE false END) cteventdateidentifier
+FROM
+  hive.default.segmentationmetadata03
+
+
+
+
+
+
+
+
+CREATE TABLE hive.default.ctevent_prop (
+   eventname varchar,
+   propertyname varchar,
+   isenumerable varchar,
+   covactivity varchar,
+   propertydatatype varchar
+)
+WITH (
+   external_location = 's3a://bgs-out-athena/ctevents_prop_metadata',
+   format = 'CSV',
+   skip_header_line_count = 1
+)
+
+
+
+CREATE VIEW minio.segmentdb_6550.ctevent_property_metadata SECURITY DEFINER AS
+SELECT *
+FROM
+  hive.default.ctevent_prop

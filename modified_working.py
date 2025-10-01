@@ -703,7 +703,7 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
         with connect_to_oracle(oracle_config) as source_conn:
             if not os.path.exists(parquet_file):
                 logger.info("Parquet file %s not found. Refreshing all distinct delta values.", parquet_file)
-                query = f"SELECT DISTINCT {delta_column} as delta_value FROM {source_table} WHERE {delta_column} IS NOT NULL ORDER BY {delta_column}"
+                query = f"SELECT /*+ PARALLEL(4) */ DISTINCT {delta_column} as delta_value FROM {source_table} WHERE {delta_column} IS NOT NULL ORDER BY {delta_column}"
                 source_deltas_df = pd.read_sql(query, source_conn)
                 if delta_column_type:
                     if delta_column_type.lower() == 'timestamp':
@@ -711,7 +711,7 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
                                                                           format=delta_column_format).dt.strftime('%Y-%m-%d'))
                     elif delta_column_type.lower() == 'date' and delta_column_format is not None:
                         source_deltas_df['DELTA_VALUE'] = (pd.to_datetime(source_deltas_df['DELTA_VALUE'],
-                                                                          format=delta_column_format).dt.strftime('%Y-%m-%d'))
+                                                            format=delta_column_format).dt.strftime('%Y-%m-%d')).drop_duplicates()
                 source_deltas_df.to_parquet(parquet_file, index=False)
                 logger.info("Saved refreshed distinct delta values to %s.", parquet_file)
             else:
@@ -778,12 +778,12 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
                 try:
                     with connect_to_oracle(oracle_config) as source_conn:
                             logger.info("Parquet file %s outdated. Refreshing all distinct delta values.", parquet_file)
-                            query = f"SELECT DISTINCT {delta_column} as delta_value FROM {source_table} WHERE {delta_column} IS NOT NULL ORDER BY {delta_column}"
+                            query = f"SELECT /*+ PARALLEL(4) */ DISTINCT {delta_column} as delta_value FROM {source_table} WHERE {delta_column} IS NOT NULL ORDER BY {delta_column}"
                             source_deltas_df = pd.read_sql(query, source_conn)
                             if delta_column_type:
                                 if delta_column_type.lower() == 'timestamp':
                                     source_deltas_df['DELTA_VALUE'] = (pd.to_datetime(source_deltas_df['DELTA_VALUE'],
-                                                                                    format=delta_column_format).dt.strftime('%Y-%m-%d'))
+                                                                                    format=delta_column_format).dt.strftime('%Y-%m-%d')).drop_duplicates()
                             source_deltas_df.to_parquet(parquet_file, index=False)
                             logger.info("Saved refreshed distinct delta values to %s.", parquet_file)
 

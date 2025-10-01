@@ -1123,7 +1123,7 @@ def oracle_to_minio_parquet(
         raise RuntimeError(f"Schema retrieval failed: {e}")
 
     if delta_column_type == 'timestamp':
-        where_part = (f" WHERE {delta_column} >= DATE '{delta_column_value}' AND {delta_column} < DATE '{delta_column_value}'" if load_type == 'historic' else "")
+        where_part = (f" WHERE {delta_column} >= DATE '{delta_column_value}' AND {delta_column} < DATE '{delta_column_value}'  + INTERVAL '1' DAY" if load_type == 'historic' else "")
         # where_part = (f" WHERE {delta_column} = TO_TIMESTAMP('{delta_column_value}', 'YYYY-MM-DD HH24:MI:SS')" if load_type == 'historic' and delta_column and delta_column_value else "")
     # elif delta_column_type == 'date':
     else:

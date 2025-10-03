@@ -2,6 +2,7 @@ import os
 import io
 import logging
 import time
+import copy
 from typing import Dict, Any, List, Optional, Union, Sequence, Tuple
 from decimal import Decimal
 from datetime import datetime, date
@@ -321,7 +322,7 @@ def prepare_auditing() -> Dict[str, Any]:
         "task_startts": "",
         "task_endts": "",
         "task_exec_secs": 0,
-        "business_loaddt": datetime.strptime(datetime.now(IST), "%Y-%m-%d"),
+        "business_loaddt": "",
         "delta_column_value": None,
         "total_records": 0,
         "extraction_time": 0,
@@ -389,27 +390,28 @@ def _parse_datetime(value: Optional[str], format: str, is_date: bool = False) ->
 
 def _ensure_time_fields(audit_data: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize types for time fields and booleans prior to MERGE."""
+    audit_data_new = audit_data.copy()
     datetime_fields = ["task_startts", "task_endts"]
     date_fields = ["business_loaddt"]
 
-    audit_data["cdp_db_count_validation"] = 'Y' if audit_data.get("cdp_db_count_validation") else 'N'
+    audit_data_new["cdp_db_count_validation"] = 'Y' if audit_data_new.get("cdp_db_count_validation") else 'N'
 
     for field in datetime_fields:
-        audit_data[field] = _parse_datetime(audit_data.get(field), DATETIMEFORMAT)
+        audit_data_new[field] = _parse_datetime(audit_data_new.get(field), DATETIMEFORMAT)
 
     for field in date_fields:
-        audit_data[field] = _parse_datetime(audit_data.get(field), "%Y-%m-%d", is_date=True)
+        audit_data_new[field] = _parse_datetime(audit_data_new.get(field), "%Y-%m-%d", is_date=True)
 
     now_ist = datetime.now(IST)
-    audit_data["updated_at_ts"] = now_ist
-    if not audit_data.get("created_at_ts"):
-        audit_data["created_at_ts"] = now_ist
-    return audit_data
+    audit_data_new["updated_at_ts"] = now_ist
+    if not audit_data_new.get("created_at_ts"):
+        audit_data_new["created_at_ts"] = now_ist
+    return audit_data_new
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
        retry=retry_if_exception_type(Exception))
-def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[str, Any], business_loaddt: str,
+def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[str, Any], aud_dt: str,
                                 delta_column_value: Optional[str] = None) -> None:
     """Load existing audit record for restart."""
     if audit_log.get("load_type") == "historic":
@@ -445,7 +447,7 @@ def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[s
                 load_type
             FROM {config_audit["schema"]}.{config_audit["audit_table"]}
             WHERE source_table = :src
-            AND business_loaddt = TO_DATE(:business_loaddt, :fmt)
+            AND business_loaddt = TO_DATE(:aud_dt, :fmt)
             AND (
                 (delta_column_value IS NULL AND :delta_val IS NULL)
                 OR delta_column_value = :delta_val
@@ -456,7 +458,7 @@ def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[s
         """
         params = {
             "src": audit_log["source_table"],
-            "business_loaddt": business_loaddt,
+            "aud_dt": aud_dt,
             "fmt": ORACLE_DATE,
             "delta_val": delta_column_value,
             "load_type": audit_log.get("load_type", "delta")
@@ -504,7 +506,9 @@ def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[s
 def update_audit_record_strict(config_audit: Dict[str, Any], audit_data: Dict[str, Any],
                               max_attempts: int = 5, wait_seconds: int = 3) -> None:
     """Strict audit update with proper composite key matching."""
-    audit_data = _ensure_time_fields(audit_data)
+    audit_data_copy = _ensure_time_fields(audit_data)
+
+    # logger.info(f"audit_data_copy: {audit_data_copy} and audit_data: {audit_data}")
 
     # For historic loads, use delta_column_value as primary key component
     if audit_data.get("load_type") == "historic":
@@ -522,7 +526,7 @@ def update_audit_record_strict(config_audit: Dict[str, Any], audit_data: Dict[st
             )
             WHEN MATCHED THEN UPDATE SET
                 delta_column_value = :delta_column_value,
-                task_startts = case when target.task_startts is NULL Then :task_startts ELSE target.task_startts END,
+                task_startts = :task_startts,
                 task_endts = :task_endts,
                 task_exec_secs = :task_exec_secs,
                 total_records = :total_records,
@@ -550,7 +554,7 @@ def update_audit_record_strict(config_audit: Dict[str, Any], audit_data: Dict[st
                 minio_filepath = :minio_filepath,
                 restart_point = :restart_point,
                 updated_at_ts = :updated_at_ts,
-                business_loaddt = case when target.business_loaddt is NULL Then :business_loaddt ELSE target.business_loaddt END
+                business_loaddt = :business_loaddt
             WHEN NOT MATCHED THEN INSERT (
                 source_table, business_loaddt, delta_column_value, load_type, task_startts, task_endts,
                 task_exec_secs, total_records, extraction_time, total_apicalls, success_apicalls,
@@ -574,7 +578,7 @@ def update_audit_record_strict(config_audit: Dict[str, Any], audit_data: Dict[st
     else:
         # Original delta load merge logic
         merge_sql = f"""
-            MERGE INTO {config_audit['schema']}.{config_audit['audit_table']} target
+            MERGE INTO {audit_data['schema']}.{audit_data['audit_table']} target
             USING (
                 SELECT
                     :source_table AS source_table,
@@ -657,7 +661,7 @@ def update_audit_record_strict(config_audit: Dict[str, Any], audit_data: Dict[st
                 audit_data.get("delta_column_value"), audit_data.get("status")
             )
 
-            cur.execute(merge_sql, audit_data)
+            cur.execute(merge_sql, audit_data_copy)
             conn.commit()
 
             logger.info("Audit update successful on attempt %s", attempt + 1)
@@ -665,6 +669,7 @@ def update_audit_record_strict(config_audit: Dict[str, Any], audit_data: Dict[st
         except Exception as e:
             last_error = e
             logger.error("Audit update failed on attempt %s/%s: %s", attempt + 1, max_attempts, e)
+            logger.error("e")
             if conn:
                 try:
                     conn.rollback()
@@ -708,7 +713,7 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
                 if delta_column_type:
                     if delta_column_type.lower() == 'timestamp':
                         source_deltas_df['DELTA_VALUE'] = (pd.to_datetime(source_deltas_df['DELTA_VALUE'],
-                                                                          format=delta_column_format).dt.strftime('%Y-%m-%d')).drop_duplicates()
+                                                                          format=delta_column_format).dt.strftime('%Y-%m-%d'))
                     elif delta_column_type.lower() == 'date' and delta_column_format is not None:
                         source_deltas_df['DELTA_VALUE'] = (pd.to_datetime(source_deltas_df['DELTA_VALUE'],
                                                             format=delta_column_format).dt.strftime('%Y-%m-%d')).drop_duplicates()
@@ -757,9 +762,6 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
 
             if row:
                 business_dt, status, restart_point, total_records, delta_val, load_type, task_exec_secs, extraction_time, aerospike_error = row
-                if business_dt in (None,"", 'NULL'):
-                    business_dt = datetime.now(IST).strftime("%Y-%m-%d")
-                    logger.info(f"after fetching row - business_dt: {business_dt}")
                 if isinstance(aerospike_error, oracledb.LOB):
                     aerospike_error = aerospike_error.read()
                 base_status = status
@@ -768,10 +770,7 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
                 base_exec_secs = float(task_exec_secs or 0)
                 base_extraction_time = float(extraction_time or 0)
                 base_delta_value = delta_val
-                if biz_str:
-                    biz_str = business_dt.strftime("%Y-%m-%d") if hasattr(business_dt, "strftime") else str(business_dt)
-                else:
-                    biz_str = current_business_loaddt
+                biz_str = (business_dt.strftime("%Y-%m-%d") if hasattr(business_dt, "strftime") else str(business_dt)) if business_dt else current_business_loaddt
 
             # Find unprocessed deltas
             try:
@@ -790,10 +789,6 @@ def get_historic_load_status(config_audit: Dict[str, Any], source_table: str,
                                 if delta_column_type.lower() == 'timestamp':
                                     source_deltas_df['DELTA_VALUE'] = (pd.to_datetime(source_deltas_df['DELTA_VALUE'],
                                                                                     format=delta_column_format).dt.strftime('%Y-%m-%d')).drop_duplicates()
-                                    
-                                elif delta_column_type.lower() == 'date' and delta_column_format is not None:
-                                    source_deltas_df['DELTA_VALUE'] = (pd.to_datetime(source_deltas_df['DELTA_VALUE'],
-                                                            format=delta_column_format).dt.strftime('%Y-%m-%d')).drop_duplicates()
                             source_deltas_df.to_parquet(parquet_file, index=False)
                             logger.info("Saved refreshed distinct delta values to %s.", parquet_file)
 
@@ -1062,7 +1057,7 @@ def oracle_to_minio_parquet(
         raise ValueError("base_object_path is required")
     try:
         logger.info(f"business_loaddt:{business_loaddt}")
-        # datetime.strptime(business_loaddt, "%Y-%m-%d")
+        datetime.strptime(business_loaddt, "%Y-%m-%d")
     except ValueError:
         raise ValueError("business_loaddt must be in YYYY-MM-DD format")
     if load_type == 'historic' and not delta_column_value:
@@ -1311,8 +1306,6 @@ def process_oracle_to_minio_with_dependencies(
         config_audit, table_name_uc, current_business_loaddt,
         load_type, delta_column,delta_column_type,delta_column_format, oracle_config=oracle_config
     )
-    logger.info(f"dates:{dates}")
-    
 
     if not dates:
         logger.info("No jobs to process - all completed or no jobs found.")
@@ -1320,11 +1313,7 @@ def process_oracle_to_minio_with_dependencies(
 
     # Process each job sequentially
     for date_info in dates:
-        biz_dt = date_info.get("business_loaddt")
-        logger.info(f"biz_dt: {biz_dt}, current_business_loaddt: {current_business_loaddt}")
-        if biz_dt in (None,"", 'NULL'):
-            biz_dt = datetime.now(IST).strftime("%Y-%m-%d")
-            logger.info(f"biz_dt: {biz_dt}")
+        biz_dt = date_info["business_loaddt"]
         status = date_info["status"]
         restart_point = int(date_info.get("restart_point") or 0)
         delta_value = date_info.get("delta_column_value")
@@ -1334,7 +1323,7 @@ def process_oracle_to_minio_with_dependencies(
                    biz_dt, status, restart_point, delta_value, info_load_type)
 
         if status == "COMPLETED" and delta_value == config_audit.get("delta_column_value"):
-            logger.info("Job for %s already COMPLETED. Skipping.", delta_value)
+            logger.info("Job for %s already COMPLETED. Skipping.", biz_dt)
             continue
 
         if status == "RUNNING":

@@ -526,7 +526,6 @@ def update_audit_record_strict(config_audit: Dict[str, Any], audit_data: Dict[st
             )
             WHEN MATCHED THEN UPDATE SET
                 delta_column_value = :delta_column_value,
-                task_startts = :task_startts,
                 task_endts = :task_endts,
                 task_exec_secs = :task_exec_secs,
                 total_records = :total_records,
@@ -553,8 +552,7 @@ def update_audit_record_strict(config_audit: Dict[str, Any], audit_data: Dict[st
                 log_path = :log_path,
                 minio_filepath = :minio_filepath,
                 restart_point = :restart_point,
-                updated_at_ts = :updated_at_ts,
-                business_loaddt = :business_loaddt
+                updated_at_ts = :updated_at_ts
             WHEN NOT MATCHED THEN INSERT (
                 source_table, business_loaddt, delta_column_value, load_type, task_startts, task_endts,
                 task_exec_secs, total_records, extraction_time, total_apicalls, success_apicalls,

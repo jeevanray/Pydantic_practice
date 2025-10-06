@@ -1,0 +1,122 @@
+{
+  "uds_to_minio":
+    {
+      "notification": false,
+      "metadata_is_file_based": false,
+      "sftp_file_format": "parquet",
+      "destination_type": "minio",
+      "audit_config": { "schema": "appuser", "audit_table": "AIRFLOW_CDP_DIAPI_RUN_LOG" },
+      "schema": "uds",
+      "output_path": "segmentation/segmentdb_6550/input_data/customer_data/customer_profile",
+      "batchsize": 100000,
+      "chunksize": 100000,
+      "delta_column_type": "date",
+      "objects":
+        [
+          {
+              "isactive": True,
+              "db_table": "test_table",
+              "schema": "appuser",
+              "db_write_method": "upsert",
+              "ORDER_BY": "",
+              "load_type": "delta",
+              "batchsize": 1000000, #"chunksize": 1000000, 
+              "output_path": "segmentation/segmentdb_6550/input_data/customer_data/test_table",
+              "schedule": "daily"
+            },
+          {
+              "isactive": True,
+              "db_table": "customer_audit",
+              "schema": "appuser",
+              "db_write_method": "upsert",
+              "ORDER_BY": "ID",
+              "load_type": "historic",
+              "delta_column": "AUD_DATE",
+              "sub_folder": "AUD_DATE",
+              "batchsize": 5, #"chunksize": 1000000, 
+              "output_path": "segmentation/segmentdb_6550/input_data/customer_data/customer_audit",
+              "schedule": "historic"
+            },
+          {
+              "isactive": false,
+              "db_table": "customer_profile",
+              "schema": "cdp_unica_refined",
+              "db_write_method": "upsert",
+              "ORDER_BY": "",
+              "load_type": "delta",
+              "batchsize": 1000000, #"chunksize": 1000000, 
+              "output_path": "segmentation/segmentdb_6550/input_data/customer_data/customer_profile",
+              "schedule": "daily"
+            },
+          {
+              "isactive": false,
+              "db_table": "retail_gdm_cust_dim",
+              "schema": "uds",
+              "db_write_method": "upsert",
+              "ORDER_BY": "CIF",
+              "load_type": "historic",
+              "delta_column": "AUD_DT",
+              "sub_folder": "AUD_DT",
+              "output_path": "segmentation/segmentdb_6550/input_data/customer_data/retail_gdm_cust_dim/",
+              #"chunksize": 1000000, 
+              "batchsize": 1000000
+            },
+          {
+              "isactive": False,
+              "db_table": "SS_DETAIL_CONVERSION_CAMPAIGN_REPORT_MVW_RAW",
+              "schema": "uds",
+              "ORDER_BY": "",
+              "load_type": "delta",
+              "batchsize": 1000000, #"chunksize": 1000000, 
+              "output_path": "segmentation/segmentdb_6550/input_data/customer_data/SS_DETAIL_CONVERSION_CAMPAIGN_REPORT_MVW_RAW/"
+            },
+          {
+              "isactive": False,
+              "db_table": "cif_ua_contacthistory",
+              "schema": "campaign",
+              "ORDER_BY": "CIF",
+              "load_type": "historic",
+              "batchsize": 1000000, # "chunksize": 1000000, 
+              "delta_column": "CONTACTDATETIME",
+              "output_path": "segmentation/segmentdb_6550/input_data/customer_data/cif_ua_contacthistory/",
+              "delta_column_type": "timestamp",
+              "delta_column_format": "%d-%m-%Y %H:%M:%S"
+            },
+          {
+              "isactive": False,
+              "db_table": "CIF_UA_ACTIONCUSTOMER",
+              "schema": "campaign",
+              "ORDER_BY": "CIF",
+              "load_type": "historic",
+              "delta_column": "ACTIONDATETIME",
+              "batchsize": 1000000,
+              # "chunksize": 1000000, 
+              "output_path": "segmentation/segmentdb_6550/input_data/customer_data/CIF_UA_ACTIONCUSTOMER/",
+              "delta_column_type": "timestamp",
+              "delta_column_format": "'%d-%m-%Y %H:%M:%S"
+            },
+          {
+              "isactive": False,
+              "db_table": "UA_CAMPAIGN",
+              "schema": "campaign",
+              # "ORDER_BY": "CIF", 
+              "load_type": "delta",
+              "batchsize": 1000000,
+              "chunksize": 1000000,
+              "output_path": "segmentation/segmentdb_6550/input_data/customer_data/UA_CAMPAIGN/",
+              "schedule": "daily"
+            },
+          {
+              "isactive": False,
+              "db_table": "UA_OFFER",
+              "schema": "campaign",
+              # "ORDER_BY": "CIF", 
+              "load_type": "delta",
+              "batchsize": 1000000,
+              "chunksize": 1000000,
+              "output_path": "segmentation/segmentdb_6550/input_data/customer_data/UA_OFFER/",
+              "schedule": "daily"
+            }
+        ]
+    }
+}

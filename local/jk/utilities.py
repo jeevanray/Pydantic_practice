@@ -11,12 +11,13 @@ from datetime import datetime
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import pyarrow as pa
 import pytz
-from minio_handler import MinioHandler
+# from minio_handler import MinioHandler
 from constants import DATETIMEFORMAT
 
-# Set up logging
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+from logconfig import get_logger
+
+# Use shared logger
+logger = get_logger(__name__)
 
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -168,10 +169,17 @@ def _ensure_time_fields(audit_data: Dict[str, Any]) -> Dict[str, Any]:
     audit_data_new["cdp_db_count_validation"] = 'Y' if audit_data_new.get("cdp_db_count_validation") else 'N'
 
     for field in datetime_fields:
-        audit_data_new[field] = _parse_datetime(audit_data_new.get(field), DATETIMEFORMAT)
+        if isinstance(audit_data.get(field), datetime):
+            pass
+        else:
+            audit_data_new[field] = _parse_datetime(audit_data_new.get(field), DATETIMEFORMAT)
 
     for field in date_fields:
-        audit_data_new[field] = _parse_datetime(audit_data_new.get(field), "%Y-%m-%d", is_date=True)
+        if isinstance(audit_data.get(field), datetime):
+            pass
+        elif isinstance(audit_data_new.get(field), str) and audit_data_new.get(field):
+            audit_data_new[field] = _parse_datetime(audit_data_new.get(field), "%Y-%m-%d", is_date=True)
+        
 
     now_ist = datetime.now(IST)
     audit_data_new["updated_at_ts"] = now_ist
@@ -306,35 +314,35 @@ def create_arrow_table_from_rows(rows: List[tuple], column_names: List[str], tar
     return cast_table_columns_to_schema(table, target_schema)
 
 
-# NEW: Pure PyArrow upload - NO pandas
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
-       retry=retry_if_exception_type(Exception))
-def upload_arrow_table_parquet(minio_client: MinioHandler, table: pa.Table,
-                               object_path: str, compression: str = "snappy") -> None:
-    """
-    Upload PyArrow Table directly as parquet. NO pandas involved.
-    """
-    try:
-        # Try MinIO handler's table upload if available
-        if hasattr(minio_client, "upload_table"):
-            return minio_client.upload_table(
-                table=table,
-                object_path=object_path,
-                format="parquet",
-                compression=compression
-            )
+# # NEW: Pure PyArrow upload - NO pandas
+# @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
+#        retry=retry_if_exception_type(Exception))
+# def upload_arrow_table_parquet(minio_client: MinioHandler, table: pa.Table,
+#                                object_path: str, compression: str = "snappy") -> None:
+#     """
+#     Upload PyArrow Table directly as parquet. NO pandas involved.
+#     """
+#     try:
+#         # Try MinIO handler's table upload if available
+#         if hasattr(minio_client, "upload_table"):
+#             return minio_client.upload_table(
+#                 table=table,
+#                 object_path=object_path,
+#                 format="parquet",
+#                 compression=compression
+#             )
 
-        # Fallback: write to buffer and upload
-        buffer = io.BytesIO()
-        pq.write_table(table, buffer, compression=compression)
-        data = buffer.getvalue()
+#         # Fallback: write to buffer and upload
+#         buffer = io.BytesIO()
+#         pq.write_table(table, buffer, compression=compression)
+#         data = buffer.getvalue()
 
-        if hasattr(minio_client, "put_object"):
-            minio_client.put_object(object_path, data, len(data),
-                                  content_type="application/octet-stream")
-        else:
-            raise RuntimeError("MinioHandler must provide upload_table or put_object method")
+#         if hasattr(minio_client, "put_object"):
+#             minio_client.put_object(object_path, data, len(data),
+#                                   content_type="application/octet-stream")
+#         else:
+#             raise RuntimeError("MinioHandler must provide upload_table or put_object method")
 
-    except Exception as e:
-        logger.error(f"Failed to upload Arrow table to {object_path}: {e}")
-        raise
+#     except Exception as e:
+#         logger.error(f"Failed to upload Arrow table to {object_path}: {e}")
+#         raise

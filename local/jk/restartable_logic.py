@@ -1,6 +1,8 @@
 import os
 import logging
 from typing import Dict, Any, List, Optional, Union, Sequence, Tuple
+from datetime import datetime
+import datetime
 
 import pandas as pd
 import oracledb
@@ -164,7 +166,6 @@ def get_delta_load_status(config_audit: Dict[str, Any], source_table: str,
         SELECT
             business_loaddt,
             NVL(status, 'NOT_STARTED') AS status,
-            NVL(restart_point, 0) AS restart_point,
             NVL(total_records, 0) AS total_records,
             delta_column_value,
             NVL(load_type, 'delta') AS load_type
@@ -172,7 +173,6 @@ def get_delta_load_status(config_audit: Dict[str, Any], source_table: str,
         WHERE business_loaddt <= TO_DATE(:current_dt, :fmt)
           AND source_table = :src
           AND NVL(load_type, 'delta') = 'delta'
-          AND delta_column_value IS NULL
           AND NVL(status, 'NOT_STARTED') IN ('NOT_STARTED', 'FAILED', 'RUNNING')
         ORDER BY business_loaddt
     """
@@ -184,12 +184,14 @@ def get_delta_load_status(config_audit: Dict[str, Any], source_table: str,
                 rows = cur.fetchall()
                 processed: List[Dict[str, Any]] = []
 
-                for business_dt, status, restart_point, total_records, delta_val, load_type in rows:
-                    biz_str = business_dt.strftime("%Y-%m-%d") if hasattr(business_dt, "strftime") else str(business_dt)
+                for business_dt, status, total_records, delta_val, load_type in rows:
+                    if hasattr(business_dt, "strftime"):
+                        biz_str = business_dt.strftime("%Y-%m-%d")
+                    else:
+                        biz_str = datetime.strptime(business_dt, '%m-%b-%d').strftime("%Y-%m-%d") if hasattr(business_dt, "strftime") else str(business_dt)
                     processed.append({
                         "business_loaddt": biz_str,
                         "status": status,
-                        "restart_point": int(restart_point or 0),
                         "total_records": int(total_records or 0),
                         "delta_column_value": delta_val,
                         "load_type": load_type

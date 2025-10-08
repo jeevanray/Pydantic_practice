@@ -60,6 +60,12 @@ def prepare_auditing() -> Dict[str, Any]:
 def initialize_restart_audit_log(config_audit: Dict[str, Any], audit_log: Dict[str, Any], aud_dt: str,
                                 delta_column_value: Optional[str] = None) -> None:
     """Load existing audit record for restart."""
+    # Defensive: ensure business_loaddt is set for delta loads so downstream MERGE
+    # operations don't insert a row with NULL business_loaddt.
+    if audit_log.get("load_type") != "historic":
+        # prefer existing value, otherwise use the supplied aud_dt
+        if not audit_log.get("business_loaddt"):
+            audit_log["business_loaddt"] = aud_dt
     if audit_log.get("load_type") == "historic":
         query = f"""
             SELECT
@@ -220,13 +226,13 @@ def update_audit_record_strict(config_audit: Dict[str, Any], audit_data: Dict[st
             )
         """
     else:
-        # Original delta load merge logic
+        # Original delta load merge logic - ensure business_loaddt is bound as a DATE using TO_DATE
         merge_sql = f"""
             MERGE INTO {config_audit['schema']}.{config_audit['audit_table']} target
             USING (
                 SELECT
                     :source_table AS source_table,
-                    :business_loaddt AS business_loaddt,
+                    :business_loaddt as business_loaddt,
                     :delta_column_value AS delta_column_value,
                     :load_type AS load_type
                 FROM dual
@@ -295,6 +301,7 @@ def update_audit_record_strict(config_audit: Dict[str, Any], audit_data: Dict[st
         conn = None
         cur = None
         try:
+            # Ensure date format binding is present when using TO_DATE in MERGE
             conn = connect_to_oracle(config_audit["target"])
             conn.autocommit = False
             cur = conn.cursor()
@@ -322,6 +329,7 @@ def update_audit_record_strict(config_audit: Dict[str, Any], audit_data: Dict[st
             if attempt < max_attempts - 1:
                 logger.warning("Waiting %s seconds before retry...", wait_seconds)
                 time.sleep(wait_seconds)
+                raise e
         finally:
             close_connection(cur, conn)
 

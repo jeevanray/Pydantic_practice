@@ -13,21 +13,15 @@ import pyarrow.parquet as pq
 # from minio_handler import MinioHandler
 # from cdp_diapi_adapter import get_system_config, close_connection
 from constants import DATETIMEFORMAT, ORACLE_DATE
-from minio_handler import MinioHandler
+from minio_handler import init_minio_client, upload_table, delete_file
 from audit import prepare_auditing, update_audit_record_strict, initialize_restart_audit_log
 from utilities import connect_to_oracle, close_connection, get_oracle_table_schema, \
     create_arrow_table_from_rows, load_config_from_yaml
 from restartable_logic import get_load_status_and_dates
+from logconfig import get_logger
 
-# Logging
-logger = logging.getLogger("Minio_framework")
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-formatter = logging.Formatter(
-    "%(asctime)s - %(levelname)s - PID:%(process)d - TID:%(thread)d - %(message)s"
-)
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+# Use shared logger
+logger = get_logger("Minio_framework")
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -53,28 +47,26 @@ def generate_object_path(base_path: str, business_loaddt: str, load_type: str,
 # NEW: Pure PyArrow upload - NO pandas
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
        retry=retry_if_exception_type(Exception))
-def upload_arrow_table_parquet(minio_client, table,
+def upload_arrow_table_parquet(minio_client, table, bucket_name: str,
                                object_path, compression: str = "snappy") -> None:
     """
     Upload PyArrow Table directly as parquet. NO pandas involved.
     """
     try:
-        # Try MinIO handler's table upload if available
-        if hasattr(minio_client, "upload_table"):
-            return minio_client.upload_table(
-                table=table, object_path=object_path,
-                format="parquet", compression=compression)
-
-        # Fallback: write to buffer and upload
-        buffer = io.BytesIO()
-        pq.write_table(table, buffer, compression=compression)
-        data = buffer.getvalue()
-
-        if hasattr(minio_client, "put_object"):
-            minio_client.put_object(object_path, data, len(data),
-                                  content_type="application/octet-stream")
-        else:
-            raise RuntimeError("MinioHandler must provide upload_table or put_object method")
+        # Use the shared upload_table function (multipart-capable)
+        try:
+            return upload_table(minio_client, table, bucket_name, object_path, compression=compression)
+        except Exception:
+            # Fallback: write to buffer and use put_object directly
+            buffer = io.BytesIO()
+            pq.write_table(table, buffer, compression=(compression or "snappy"))
+            buffer.seek(0)
+            data = buffer.getvalue()
+            if hasattr(minio_client, "put_object"):
+                # put_object expects (bucket, object_name, data, length, ...)
+                minio_client.put_object(bucket_name, object_path, io.BytesIO(data), len(data), content_type="application/octet-stream")
+            else:
+                raise RuntimeError("Provided minio client does not support put_object")
 
     except Exception as e:
         logger.error(f"Failed to upload Arrow table to {object_path}: {e}")
@@ -197,7 +189,7 @@ def oracle_to_minio_parquet(
 
     try:
         conn = connect_to_oracle(oracle_config)
-        mclient = MinioHandler(minio_config)
+        mclient = init_minio_client(minio_config)
         cur = conn.cursor()
         cur.arraysize = max(10_000, min(chunk_size, 100_000))
         logger.info("Executing SELECT for streaming: %s", select_sql)
@@ -235,7 +227,7 @@ def oracle_to_minio_parquet(
 
             try:
                 # PURE PYARROW UPLOAD - NO PANDAS
-                upload_arrow_table_parquet(mclient, table_chunk, object_name, compression=compression)
+                upload_arrow_table_parquet(mclient, table_chunk, bucket, object_name, compression=compression)
                 recs = table_chunk.num_rows
                 if chunk_index % 10 == 0:
                     logger.info("Successfully uploaded chunk %s (%s rows) with Arrow-optimized schema",
@@ -275,10 +267,13 @@ def oracle_to_minio_parquet(
                 logger.error("Audit update failed for chunk %s; deleting uploaded object: %s/%s",
                            chunk_index, bucket, object_name)
                 try:
-                    if hasattr(mclient, "delete_file"):
-                        mclient.delete_file(object_name, bucket)
-                    elif hasattr(mclient, "remove_object"):
-                        mclient.remove_object(bucket, object_name)
+                    # Use our module-level delete_file helper (safer portable call)
+                    try:
+                        delete_file(mclient, bucket, object_name)
+                    except Exception:
+                        # fallback to Minio client's remove_object
+                        if hasattr(mclient, "remove_object"):
+                            mclient.remove_object(bucket, object_name)
                     logger.info("Cleaned up uploaded object after audit failure")
                 except Exception as del_err:
                     logger.error("Failed to delete object after audit failure: %s", del_err)
@@ -310,8 +305,7 @@ def oracle_to_minio_parquet(
             logger.error("Final audit update failed: %s", e)
             raise RuntimeError(f"Final audit update failed: {e}")
 
-        if hasattr(mclient, 'close'):
-            mclient.close()
+        # Minio client does not provide explicit close; nothing to do here
 
     except Exception as e:
         final_ist = datetime.now(IST)
@@ -481,7 +475,8 @@ def process_from_config(config: Dict[str, Any], conn_config: Dict[str, Any],
 
 # Main execution
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+    # Ensure logging is configured via shared logger
+    get_logger("Minio_framework")
 
     try:
         # conn_config = get_system_config()

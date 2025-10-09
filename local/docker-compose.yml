@@ -1,0 +1,31 @@
+version: "3.8"
+services:
+  oracle:
+    image: gvenzl/oracle-xe:18-slim
+    container_name: oracle-xe
+    environment:
+      ORACLE_PASSWORD: "Password123"
+    ports:
+      - "1521:1521"
+    volumes:
+      - ./oracle-data:/opt/oracle/oradata
+      - ./oracle-init:/container-entrypoint-initdb.d
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "minioadmin"
+      MINIO_ROOT_PASSWORD: "minioadmin"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console UI
+    volumes:
+      - ./minio-data:/data
+    restart: unless-stopped
+
+volumes:
+  oracle-data:
+  minio-data:

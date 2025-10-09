@@ -1,0 +1,7 @@
+docker run -d \
+  --name local-mongo \
+  -p 27017:27017 \
+  -e MONGO_INITDB_ROOT_USERNAME=root \
+  -e MONGO_INITDB_ROOT_PASSWORD=pass123 \
+  -v mongo_data:/data/db \
+  mongo:6.0

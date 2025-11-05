@@ -1,0 +1,109 @@
+import aerospike
+import json
+import hashlib
+import traceback
+from datetime import datetime
+from multiprocessing import Process, current_process
+
+# Aerospike client configuration
+config = {
+    'hosts': [('10.214.97.175', 13000)]
+}
+
+namespace = 'cdpstore'
+set_name = 'VIZVRM6551_profile'
+BATCH_SIZE = 1000
+NUM_WORKERS = 4  # Number of parallel processes
+LOG_EVERY = 100_000  # Log progress every N records
+
+def log(msg, level="INFO", process_id=None):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    prefix = f"[{level}]"
+    if process_id is not None:
+        prefix += f" [Process {process_id}]"
+    print(f"{timestamp} {prefix} {msg}")
+
+def hash_key_mod(key):
+    """
+    Converts user key to a consistent hashable integer.
+    """
+    user_key = key[2]
+    if isinstance(user_key, int):
+        return user_key
+    key_str = str(user_key).encode()
+    return int(hashlib.md5(key_str).hexdigest(), 16)
+
+def process_batch(client, batch):
+    for key, meta, bins in batch:
+        try:
+            pf_raw = bins.get('pf')
+            if pf_raw is None:
+                continue
+
+            if isinstance(pf_raw, bytes):
+                pf_raw = pf_raw.decode('utf-8')
+
+            pf_data = json.loads(pf_raw)
+
+            if pf_data.get('CUST_NAME') != "":
+                pf_data['CUST_NAME'] = ""
+                client.put(key, {'pf': json.dumps(pf_data)})
+
+        except Exception as e:
+            log(f"Key {key}: {e}", level="ERROR", process_id=current_process().name)
+            traceback.print_exc()
+
+def worker(process_id, total_workers):
+    try:
+        client = aerospike.client(config).connect()
+        log("Connected.", process_id=process_id)
+
+        batch = []
+        counter = 0
+
+        def callback(record):
+            nonlocal batch, counter
+            key = record[0]
+
+            if (hash_key_mod(key) % total_workers) != process_id:
+                return  # Skip keys not belonging to this worker
+
+            batch.append(record)
+            counter += 1
+
+            if len(batch) >= BATCH_SIZE:
+                process_batch(client, batch)
+                batch.clear()
+
+            if counter % LOG_EVERY == 0:
+                log(f"Updated {counter} records so far...", process_id=process_id)
+
+        scan = client.scan(namespace, set_name)
+        scan.select('pf')
+        scan.foreach(callback)
+
+        if batch:
+            process_batch(client, batch)
+            log(f"Updated {counter} records total.", process_id=process_id)
+
+        client.close()
+        log("Complete.", process_id=process_id)
+
+    except Exception as e:
+        log(f"{e}", level="ERROR", process_id=current_process().name)
+        traceback.print_exc()
+
+def main():
+    processes = []
+    for pid in range(NUM_WORKERS):
+        p = Process(target=worker, args=(pid, NUM_WORKERS), name=f"Worker-{pid}")
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    log("All workers completed.")
+
+if __name__ == "__main__":
+    main()

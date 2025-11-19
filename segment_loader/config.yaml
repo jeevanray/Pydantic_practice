@@ -1,0 +1,8 @@
+{
+  "storage": { "type": "minio", "endpoint_url": "http://localhost:9000", "secure": false, "bucket": "segmentation", "folder": "test", "access_key": "minioadmin", "secret_key": "minioadmin" },
+
+  "audit": { "user": "system", "password": "Password123", "dsn": "localhost:1521/XE", "audit_table": "AUDIT_LOG_SEGMENT" },
+  "target": { "user": "system", "password": "Password123", "dsn": "localhost:1521/XE", "target_table": "ORDERS" },
+
+  "pipeline": { "file_type": "csv", "columns": [ "CIF" ], "target_table": "ORDERS" }
+}

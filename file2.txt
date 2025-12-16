@@ -1,0 +1,176 @@
+import time
+import logging
+from airflow.models import Variable
+from airflow import DAG
+from airflow.operators.dummy import DummyOperator
+from airflow.operators.python import PythonOperator
+from kubernetes import client, config
+from kubernetes.client.rest import ApiException
+from kubernetes.client import V1PersistentVolumeClaim, V1ObjectMeta
+from kubernetes.client import models as k8s
+from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+from airflow.hooks.base_hook import BaseHook
+from datetime import datetime
+from pytz import timezone
+
+## Default JOB Parameters
+DAG_NAME = 'CDP_DB_TO_Minio'
+CDP_RUN_FILE = 'CDP_minio_ingestion.py'
+## Fetch the system parameters
+HOME_PATH = Variable.get('HOME_PATH', '/opt/airflow')
+SCRIPT_PATH = Variable.get('SCRIPT_PATH')
+DAGS_PVC = Variable.get('DAGS_PVC')
+LOGS_PVC = Variable.get('LOGS_PVC')
+STG_PVC = Variable.get('STG_PVC', deserialize_json=True)
+IMAGE = Variable.get('IMAGE')
+NAMESPACE = Variable.get('NAMESPACE')
+AIRFLOW_USER = Variable.get('AIRFLOW_USER')
+## Initialize Logger
+logger = logging.getLogger(__name__)
+
+# Default args of dags
+default_args = {
+    'owner': "HCL MARTECH",
+    'email': [],
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 0,
+    'retry_delay': 300,
+    'retry_exponential_backoff': True,
+    'start_date': datetime(2025, 6, 10),
+    'schedule_interval': None,
+    'catchup': False,
+    'description': 'Execute everyday at 9.15 a.m. IST - To Load data to Oracle',
+    'timezone': timezone('Asia/Kolkata')
+}
+
+def create_pvc(pvc_dict, namespace=NAMESPACE):
+    '''
+    The Method create the PVC is doesn't exist and retries after 5 sec till the stua becomes
+    to Bound for 3 minutes otherwise after 3 minutes will result in an error and manual
+    intervention would be required.
+    '''
+    try:
+        pvc_name = pvc_dict['name']
+        counter = 0
+        config.load_incluster_config()
+        v1_pvc = client.CoreV1Api()
+        pvc = v1_pvc.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+        if pvc is not None:
+            logger.info(f'PVC {pvc_name} already exist. Status: {pvc.status.phase}')
+
+            while pvc.status.phase != 'Bound':
+                logger.info(f'Waiting for PVC {pvc_name} to be Bound. Current Status: {pvc.status.phase}')
+                time.sleep(5)
+                counter += 5
+                if counter > 180:
+                    raise Exception('Issue Bounding the PVC Manual intervention required')
+                pvc = v1_pvc.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+            logger.info(f'PVC {pvc_name} now status: {pvc.status.phase}')
+    except ApiException as e:
+        counter = 0
+        if e.status == 404:
+            logger.info(f'PVC {pvc_name} not found. Creating!')
+            ## Define stars of PVC
+            pvc = V1PersistentVolumeClaim(
+                metadata=V1ObjectMeta(name=pvc_name),
+                spec={
+                    'accessModes': pvc_dict['accessModes'],
+                    'resources': pvc_dict['resources'],
+                    'storageClassName': pvc_dict['storageClassName']
+                }
+            )
+            ## Create PVC
+            v1_pvc.create_namespaced_persistent_volume_claim(namespace=namespace, body=pvc)
+
+            #Wait for PVC Status to be changed to Bound
+            while pvc.status is None or pvc.status.phase != 'Bound':
+                logger.info(f'Waiting for PVC {pvc_name} to be Bound. Current Status: {pvc.status.phase}')
+                time.sleep(5)
+                counter += 5
+                if counter > 180:
+                    raise Exception('Issue Bounding the PVC Manual intervention required')
+                pvc = v1_pvc.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+            logger.info(f'PVC {pvc_name} now status: {pvc.status.phase}')
+        else:
+            raise e
+
+def create_worker_tasks(dag):
+    '''
+    The Method Mounts the PVC volume and create the K8PodOperations
+    downstream for airflow task
+    '''
+    ## Initialize parameters
+    dag_volume = 'airflow-dags-volume'
+    logs_volume = 'airflow-logs-volume'
+    stg_volume = 'airflow-worker-tmp-volume'
+    vol = []
+
+    ## This should run for the very first run otherwise the check
+    ## will become overhead
+    if STG_PVC['status'] or STG_PVC['status'].upper() == 'TRUE':
+        create_pvc(STG_PVC)
+
+    ## create the list of volumemounts
+    def create_volumesmounts(path, volume_name):
+        var = ''
+        if path == 'etl_inward_files' or path == 'logs':
+            var = k8s.V1VolumeMount(
+               name=volume_name, mount_path=f'{HOME_PATH}/{path}'
+            )
+        else:
+            var = k8s.V1VolumeMount(
+                name=volume_name, mount_path=f'{HOME_PATH}/{path}',
+                sub_path=path.split('_')[-1]
+            )
+        return var
+    ## Iterate over the folder/mounts to be created
+    for path in ['dags', 'etl_scripts', 'etl_configs', 'etl_metadata']:
+        vol.append(create_volumesmounts(path, dag_volume))
+
+    vol.append(create_volumesmounts('logs', logs_volume))
+    vol.append(create_volumesmounts('etl_inward_files', stg_volume))
+
+    volume_dag = k8s.V1Volume(
+        name=dag_volume,
+        persistent_volume_claim=k8s.V1PersistentVolumeClaimVolumeSource(claim_name=DAGS_PVC),
+    )
+    volume_log = k8s.V1Volume(
+        name=logs_volume,
+        persistent_volume_claim=k8s.V1PersistentVolumeClaimVolumeSource(claim_name=LOGS_PVC),
+    )
+    volume_worker_stg = k8s.V1Volume(
+        name=stg_volume,
+        persistent_volume_claim=k8s.V1PersistentVolumeClaimVolumeSource(claim_name=STG_PVC['name']),
+    )
+
+    return KubernetesPodOperator(
+        task_id=f'cdp_minio_ingestion',
+        namespace=NAMESPACE,
+        image=IMAGE,
+        cmds=['bash', '-c'],
+        arguments=[f'python {SCRIPT_PATH}{CDP_RUN_FILE}'],
+        volumes=[volume_dag, volume_log, volume_worker_stg],
+        volume_mounts=vol,
+        is_delete_operator_pod=True,
+        # Run the container as root to allow elevated permissions
+        #security_context=k8s.V1SecurityContext(run_as_user=AIRFLOW_USER, privileged=True),
+        dag=dag
+    )
+
+# Airflow DAG definition
+with DAG(dag_id=DAG_NAME, default_args=default_args, schedule_interval=default_args['schedule_interval'], catchup=default_args['catchup']) as dag:
+    start_task = DummyOperator(
+        task_id='start',
+        dag=dag,
+    )
+    end_task = DummyOperator(
+        task_id='end',
+        dag=dag,
+    )
+    start_task >> create_worker_tasks(dag) >> end_task
+
+
+
+
